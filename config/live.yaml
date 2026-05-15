@@ -1,0 +1,31 @@
+profile: live
+
+# WARNING: live profile is intentionally restrictive at scaffold time.
+# Do not change `enabled: false` until Phase D pre-live audit is complete.
+enabled: false
+
+account:
+  starting_equity_usd: 10000   # actual equity comes from broker; this is just a sizing reference
+
+broker:
+  alpaca:
+    base_url: https://api.alpaca.markets
+    data_url: https://data.alpaca.markets
+    data_feed: iex
+
+# Live risk is *tighter* than paper while ramping
+risk:
+  daily_loss_limit_pct: 1.0
+  weekly_loss_limit_pct: 3.0
+  per_position_max_pct: 3.0
+  per_trade_risk_pct: 0.25
+  max_concurrent_positions: 10
+  max_per_asset_class: 5
+  asset_class_caps:
+    stocks: 0.60
+    crypto: 0.30
+    forex: 0.30
+  sector_cap_pct: 20.0
+  portfolio_var_cap_pct: 1.0
+
+# Other settings inherit from paper.yaml at load time (handled in ea/config.py)

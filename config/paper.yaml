@@ -1,0 +1,56 @@
+profile: paper
+
+account:
+  starting_equity_usd: 10000
+
+broker:
+  alpaca:
+    base_url: https://paper-api.alpaca.markets
+    data_url: https://data.alpaca.markets
+    data_feed: iex   # free tier; switch to "sip" if SIP subscription added
+
+risk:
+  daily_loss_limit_pct: 2.0
+  weekly_loss_limit_pct: 5.0
+  per_position_max_pct: 5.0
+  per_trade_risk_pct: 0.5
+  max_concurrent_positions: 15
+  max_per_asset_class: 8
+  asset_class_caps:
+    stocks: 0.60
+    crypto: 0.30
+    forex: 0.30
+  sector_cap_pct: 25.0
+  portfolio_var_cap_pct: 1.5
+
+universe:
+  stocks:
+    min_price: 5.0
+    min_avg_dollar_volume: 10_000_000
+    exclude_otc: true
+  crypto:
+    quote: USD
+    top_n_by_volume: 50
+  forex:
+    pairs: [EUR_USD, USD_JPY, GBP_USD, AUD_USD, USD_CAD, USD_CHF, NZD_USD]
+
+news:
+  llm:
+    # provider: anthropic | gemini | none
+    # Default to gemini because of its free tier. Switch to anthropic if you have an
+    # ANTHROPIC_API_KEY and prefer Claude's quality. "none" disables analysis entirely.
+    provider: gemini
+    # cheap_model / deep_model interpreted per provider:
+    #   anthropic: claude-haiku-4-5-20251001 / claude-sonnet-4-6
+    #   gemini:    gemini-2.5-flash          / gemini-2.5-pro
+    cheap_model: gemini-2.5-flash-lite
+    deep_model: gemini-2.5-flash
+    # Free tier (1500 req/day Flash, lower for Pro). Switch to gemini-2.5-pro
+    # for deep_model only if you've enabled paid billing in AI Studio.
+    daily_spend_alert_usd: 5.00
+    relevance_threshold: 0.5
+    materiality_threshold: 0.6
+
+regime_filters:
+  vix_high_threshold: 30
+  btc_realized_vol_high_pct: 100
