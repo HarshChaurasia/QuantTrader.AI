@@ -51,9 +51,9 @@ def app_client(tmp_path, monkeypatch, fake_broker):
 def test_index_renders(app_client):
     r = app_client.get("/")
     assert r.status_code == 200
-    assert "EA //" in r.text
-    assert "ACCOUNT" in r.text
-    assert "JetBrains+Mono" in r.text  # font loaded
+    assert "QuantTrader" in r.text
+    assert "Watchlist" in r.text
+    assert "Inter" in r.text  # font loaded
 
 
 def test_healthz(app_client):

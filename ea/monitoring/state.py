@@ -152,12 +152,17 @@ def alerts_snapshot(limit: int = 20) -> list[dict]:
     ]
 
 
+def _asset_class_for(symbol: str) -> AssetClass:
+    return AssetClass.CRYPTO if "/" in symbol else AssetClass.STOCK
+
+
 def watchlist_snapshot() -> list[dict]:
     """Watchlist with last/change from live bars if available, else from store."""
     s = get_state()
     out: list[dict] = []
     for sym in s.watchlist:
-        df = s.store.get_bars(sym, "1Day", AssetClass.STOCK)
+        ac = _asset_class_for(sym)
+        df = s.store.get_bars(sym, "1Day", ac)
         live = s.latest_bars.get(sym)
         if df.empty and live is None:
             out.append({"symbol": sym, "last": None, "change_pct": None, "bars": 0, "live": False})
@@ -181,7 +186,7 @@ def watchlist_snapshot() -> list[dict]:
 
 def chart_data(symbol: str, limit: int = 200) -> dict:
     s = get_state()
-    df = s.store.get_bars(symbol, "1Day", AssetClass.STOCK)
+    df = s.store.get_bars(symbol, "1Day", _asset_class_for(symbol))
     if df.empty:
         return {"symbol": symbol, "bars": []}
     df_tail = df.tail(limit)

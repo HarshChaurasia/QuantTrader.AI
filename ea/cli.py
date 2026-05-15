@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from ea.config import get_config
 
 import typer
@@ -160,6 +162,86 @@ def data_backfill(
     console.print(t)
     total = sum(r.rows_written for r in results)
     console.print(f"\nTotal rows written: [bold]{total:,}[/bold] (store: {store.path})")
+
+
+@data_app.command("backfill-universe")
+def data_backfill_universe(
+    top_n: int = typer.Option(500, help="Backfill top-N most liquid US stocks (set 0 for all tradable; expect ~10k symbols)"),
+    start: str = typer.Option("2023-01-01", help="Start date YYYY-MM-DD"),
+    end: str | None = typer.Option(None, help="End date (default: today)"),
+    concurrency: int = typer.Option(8, help="Parallel symbol fetches (Alpaca rate-limit safe at 8)"),
+    bootstrap_days: int = typer.Option(30, help="Days of recent bars to pull for liquidity ranking"),
+) -> None:
+    """Bulk-backfill the universe of US-equity Alpaca-tradable assets.
+
+    Two-pass:
+      1. Fetch all tradable assets from Alpaca; pull recent bars for ranking.
+      2. Rank by 20d ADV; backfill top_n symbols' full history.
+
+    With top_n=0 every active US stock gets backfilled (~10k symbols, ~10-20 min,
+    several MB of data).
+    """
+    setup_logging()
+    cfg = _require_alpaca_creds()
+    from ea.brokers.models import AssetClass
+    from ea.data.backfill import backfill_symbols
+    from ea.data.store import BarStore
+    from ea.data.universe import list_tradable_assets, scan_liquid_universe
+
+    start_dt = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+    end_dt = (datetime.fromisoformat(end).replace(tzinfo=timezone.utc)
+              if end else datetime.now(timezone.utc))
+    store = BarStore()
+
+    console.print(f"[bold]Step 1[/bold] · Listing Alpaca tradable assets...")
+    assets = asyncio.run(list_tradable_assets(cfg))
+    all_syms = [a.symbol for a in assets]
+    console.print(f"  Found [cyan]{len(all_syms)}[/cyan] tradable US-equity assets")
+
+    if top_n == 0:
+        target_syms = all_syms
+        console.print(f"\n[bold]Step 2[/bold] · Backfilling ALL {len(target_syms)} symbols (this may take a while)...")
+    else:
+        # Bootstrap: get recent bars across all assets so we can rank by liquidity
+        bootstrap_start = datetime.now(timezone.utc) - pd.Timedelta(days=bootstrap_days * 2)
+        console.print(
+            f"\n[bold]Step 2a[/bold] · Bootstrap-fetching {bootstrap_days}d of bars "
+            f"for {len(all_syms)} symbols to rank by liquidity (concurrency={concurrency})..."
+        )
+        progress_every = max(50, len(all_syms) // 20)
+        def _prog(done, total, r):
+            if done % progress_every == 0 or done == total:
+                console.print(f"  ... {done}/{total} ({r.symbol}: {r.rows_written} rows)")
+        boot = asyncio.run(backfill_symbols(
+            cfg, store, all_syms, start=bootstrap_start, end=end_dt,
+            timeframe="1Day", asset_class=AssetClass.STOCK,
+            concurrency=concurrency, progress_cb=_prog,
+        ))
+        ok_boot = sum(1 for r in boot if r.ok)
+        console.print(f"  Bootstrap done: {ok_boot}/{len(boot)} symbols have recent bars")
+
+        console.print(f"\n[bold]Step 2b[/bold] · Ranking by 20d ADV (price >= ${cfg.profile.universe.stocks.min_price}, ADV >= ${cfg.profile.universe.stocks.min_avg_dollar_volume:,.0f})...")
+        ranked = scan_liquid_universe(cfg, store, lookback_days=20)
+        console.print(f"  [cyan]{len(ranked)}[/cyan] passed liquidity filter")
+        target_syms = [e.symbol for e in ranked[:top_n]]
+        console.print(f"  Selected top [bold]{len(target_syms)}[/bold] for full backfill")
+
+    console.print(f"\n[bold]Step 3[/bold] · Full-history backfill from {start_dt.date()} for {len(target_syms)} symbols...")
+    progress_every = max(20, len(target_syms) // 25)
+    def _prog2(done, total, r):
+        if done % progress_every == 0 or done == total:
+            console.print(f"  ... {done}/{total} ({r.symbol}: {r.rows_written} rows)")
+    final = asyncio.run(backfill_symbols(
+        cfg, store, target_syms, start=start_dt, end=end_dt,
+        timeframe="1Day", asset_class=AssetClass.STOCK,
+        concurrency=concurrency, progress_cb=_prog2,
+    ))
+    ok = sum(1 for r in final if r.ok)
+    fail = [r.symbol for r in final if not r.ok][:10]
+    total_rows = sum(r.rows_written for r in final)
+    console.print(f"\n[bold green]Done.[/bold green] {ok}/{len(final)} symbols backfilled, {total_rows:,} rows written.")
+    if fail:
+        console.print(f"  First failures: {fail}")
 
 
 @data_app.command("universe")
@@ -333,47 +415,72 @@ def backtest(
     starting_equity: float = typer.Option(10_000.0),
     strategies: str = typer.Option(
         "xsection_momentum",
-        help="Comma-separated. Available: xsection_momentum, news_momentum",
+        help="Comma-separated. Available: xsection_momentum, news_momentum, smc",
     ),
+    walk_forward: bool = typer.Option(False, help="Segmented out-of-sample windows, compounded"),
+    window_days: int = typer.Option(90, help="Walk-forward window length (days)"),
+    report: bool = typer.Option(False, help="Also write markdown+JSON report to ./reports"),
 ) -> None:
     """Run a daily-bar backtest using bars in the local store."""
     setup_logging()
     cfg = get_config()
     from datetime import datetime as DT
     from ea.backtest.engine import BacktestEngine
+    from ea.backtest.report import write_report
+    from ea.backtest.walkforward import run_walk_forward
     from ea.brokers.models import AssetClass
     from ea.data.store import BarStore
     from ea.strategies.news_momentum import NewsMomentumStrategy
+    from ea.strategies.smc.strategy import SMCStrategy
     from ea.strategies.xsection_momentum import CrossSectionalMomentumStrategy
 
     sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     start_dt = DT.fromisoformat(start).replace(tzinfo=timezone.utc)
     end_dt = (DT.fromisoformat(end).replace(tzinfo=timezone.utc) if end else datetime.now(timezone.utc))
 
+    # SMC filters on bar timeframe; backtest replays 1Day bars, so it must be
+    # constructed for "1Day" or it never fires.
     strat_map = {
         "xsection_momentum": CrossSectionalMomentumStrategy,
         "news_momentum": NewsMomentumStrategy,
+        "smc": lambda: SMCStrategy(timeframe="1Day"),
     }
-    chosen = []
+    names = []
     for s in strategies.split(","):
         s = s.strip()
         if s not in strat_map:
             console.print(f"[red]unknown strategy: {s}[/red]")
             raise typer.Exit(1)
-        chosen.append(strat_map[s]())
+        names.append(s)
+
+    def make_strategies():
+        return [strat_map[n]() for n in names]
 
     store = BarStore()
-    engine = BacktestEngine(cfg, store, chosen, starting_equity=starting_equity)
-    result = engine.run(sym_list, start_dt, end_dt, AssetClass.STOCK)
+    if walk_forward:
+        result = run_walk_forward(
+            cfg, store, make_strategies, sym_list, start_dt, end_dt,
+            window_days=window_days, starting_equity=starting_equity,
+            asset_class=AssetClass.STOCK,
+        )
+        console.print(f"\n[bold cyan]Walk-forward result[/bold cyan]")
+        for line in result.summary_lines():
+            console.print(line)
+    else:
+        engine = BacktestEngine(cfg, store, make_strategies(), starting_equity=starting_equity)
+        result = engine.run(sym_list, start_dt, end_dt, AssetClass.STOCK)
+        console.print(f"\n[bold cyan]Backtest result[/bold cyan]")
+        for line in result.summary_lines():
+            console.print(line)
+        if result.by_strategy:
+            console.print("\n[bold]By strategy:[/bold]")
+            for name, st in result.by_strategy.items():
+                wr = (st["wins"] / st["trades"] * 100) if st["trades"] else 0
+                console.print(f"  {name}: {st['trades']} trades, ${st['pnl']:+,.2f} pnl, {wr:.1f}% wins")
 
-    console.print(f"\n[bold cyan]Backtest result[/bold cyan]")
-    for line in result.summary_lines():
-        console.print(line)
-    if result.by_strategy:
-        console.print("\n[bold]By strategy:[/bold]")
-        for name, st in result.by_strategy.items():
-            wr = (st["wins"] / st["trades"] * 100) if st["trades"] else 0
-            console.print(f"  {name}: {st['trades']} trades, ${st['pnl']:+,.2f} pnl, {wr:.1f}% wins")
+    if report:
+        path = write_report(result, label="walkforward" if walk_forward else "backtest")
+        console.print(f"\n[dim]report: {path}[/dim]")
 
 
 @app.command()

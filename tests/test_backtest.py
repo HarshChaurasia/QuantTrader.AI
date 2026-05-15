@@ -51,6 +51,33 @@ def test_backtest_runs_on_trending_universe(tmp_path):
     assert "WINNER" in traded_syms or "MID" in traded_syms
 
 
+def test_walk_forward_compounds_and_reports(tmp_path):
+    """Walk-forward stitches windows; report writer emits md+json."""
+    from ea.backtest.walkforward import run_walk_forward
+    from ea.backtest.report import write_report
+
+    cfg = load_config(profile="paper")
+    store = BarStore(tmp_path / "wf.duckdb")
+    store.upsert_bars(_make_trending_bars(100, +0.5, 300), "WINNER", "1Day", AssetClass.STOCK)
+    store.upsert_bars(_make_trending_bars(100, +0.05, 300), "SLOW", "1Day", AssetClass.STOCK)
+    store.upsert_bars(_make_trending_bars(100, -0.1, 300), "LOSER", "1Day", AssetClass.STOCK)
+
+    result = run_walk_forward(
+        cfg, store, lambda: [CrossSectionalMomentumStrategy(top_n=1)],
+        ["WINNER", "SLOW", "LOSER"],
+        start=datetime(2023, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2023, 10, 1, tzinfo=timezone.utc),
+        window_days=90, starting_equity=10_000.0, slippage_bps=0,
+    )
+    assert len(result.windows) >= 2
+    assert result.starting_equity == 10_000.0
+    assert not result.combined_equity.index.duplicated().any()
+
+    md = write_report(result, outdir=tmp_path / "reports", label="walkforward")
+    assert md.exists()
+    assert md.with_suffix(".json").exists()
+
+
 def test_backtest_raises_on_empty_data(tmp_path):
     cfg = load_config(profile="paper")
     store = BarStore(tmp_path / "bt.duckdb")

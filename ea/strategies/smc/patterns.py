@@ -101,11 +101,11 @@ def detect_order_blocks(
     Bullish OB = last bearish candle before strong rally.
     Bearish OB = last bullish candle before strong drop.
     """
-    if df is None or len(df) < impulse_n + 2:
+    if df is None or len(df) < impulse_n + 1:
         return []
     work = df.tail(lookback_bars + impulse_n + 2).reset_index()
     out: list[Zone] = []
-    for i in range(len(work) - impulse_n - 1):
+    for i in range(len(work) - impulse_n):
         cur = work.iloc[i]
         impulse = work.iloc[i + 1: i + 1 + impulse_n]
         open_p = float(impulse["open"].iloc[0])

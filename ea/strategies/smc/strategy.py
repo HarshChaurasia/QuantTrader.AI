@@ -24,21 +24,27 @@ from ea.strategies.smc.patterns import (
 
 
 def _best_zone(zones: list[Zone], current_price: float, side: str) -> Optional[Zone]:
-    """Return closest unmitigated zone to current price on the given side."""
+    """Return closest unmitigated zone to current price on the given side.
+
+    Bullish (demand): a zone at or below price that price can retrace *into*.
+    We keep any zone whose low is at/below current price (price hasn't broken
+    through it yet) — this includes zones that currently *contain* price, so
+    the in-zone check downstream can actually fire. Pick the highest such zone
+    (nearest from below / containing). Bearish is mirrored.
+    """
     candidates = [z for z in zones if z.side == side and not z.mitigated]
     if not candidates:
         return None
     if side == "bullish":
-        # Want a zone *below* current price (entry on retrace down)
-        below = [z for z in candidates if z.high <= current_price]
-        if not below:
+        relevant = [z for z in candidates if z.low <= current_price]
+        if not relevant:
             return None
-        return max(below, key=lambda z: z.high)  # closest to price from below
+        return max(relevant, key=lambda z: z.high)  # nearest from below / containing
     else:
-        above = [z for z in candidates if z.low >= current_price]
-        if not above:
+        relevant = [z for z in candidates if z.high >= current_price]
+        if not relevant:
             return None
-        return min(above, key=lambda z: z.low)
+        return min(relevant, key=lambda z: z.low)  # nearest from above / containing
 
 
 def evaluate_setup(df: pd.DataFrame, risk_reward: float = 2.0) -> Optional[dict]:
@@ -89,30 +95,38 @@ def evaluate_setup(df: pd.DataFrame, risk_reward: float = 2.0) -> Optional[dict]
         return None
     confluence.append(f"{zone.kind}↑" if side == "bullish" else f"{zone.kind}↓")
 
-    height = zone.height or (current_price * 0.005)
+    # Enforce a minimum zone width: raw FVGs/OBs can be a few cents wide, which
+    # makes "price inside the zone" practically impossible. Pad thin zones to at
+    # least MIN_ZONE_PCT of price, centered on the original zone midpoint.
+    MIN_ZONE_PCT = 0.004  # 0.4% of price
+    z_mid = (zone.low + zone.high) / 2
+    min_half = current_price * MIN_ZONE_PCT / 2
+    z_low = min(zone.low, z_mid - min_half)
+    z_high = max(zone.high, z_mid + min_half)
+    height = (z_high - z_low) or (current_price * 0.005)
+
     if side == "bullish":
-        entry_low, entry_high = zone.low, zone.high
-        stop = zone.low - height * 0.5
-        risk = current_price - stop  # use current price as worst-case fill at zone top
-        target = current_price + risk * risk_reward
-        # actually compute from zone mid for fairer RR projection
+        entry_low, entry_high = z_low, z_high
+        stop = z_low - height * 0.5
         entry_mid = (entry_low + entry_high) / 2
         risk_at_mid = entry_mid - stop
         target = entry_mid + risk_at_mid * risk_reward
         in_zone = entry_low <= current_price <= entry_high
         distance_pct = (current_price - entry_high) / current_price * 100
     else:
-        entry_low, entry_high = zone.low, zone.high
-        stop = zone.high + height * 0.5
+        entry_low, entry_high = z_low, z_high
+        stop = z_high + height * 0.5
         entry_mid = (entry_low + entry_high) / 2
         risk_at_mid = stop - entry_mid
         target = entry_mid - risk_at_mid * risk_reward
         in_zone = entry_low <= current_price <= entry_high
         distance_pct = (entry_low - current_price) / current_price * 100
 
+    # Proximity bands widened: SMC swing entries trigger on a retrace that can
+    # take a while, so treat anything within 4% as "approaching".
     if in_zone:
         status = "in_zone"
-    elif abs(distance_pct) < 2.0:
+    elif abs(distance_pct) < 4.0:
         status = "approaching"
     else:
         status = "watching"
@@ -137,17 +151,18 @@ class SMCStrategy(Strategy):
     name = "smc"
     asset_classes = {AssetClass.STOCK, AssetClass.CRYPTO, AssetClass.FOREX}
 
-    def __init__(self, risk_reward: float = 2.0, horizon_days: int = 7):
+    def __init__(self, risk_reward: float = 2.0, horizon_days: int = 7, timeframe: str = "1Hour"):
         self.risk_reward = risk_reward
         self.horizon_days = horizon_days
+        self.timeframe = timeframe
         self._last_signal_ts: dict[str, datetime] = {}
 
     def on_bar(self, event: BarEvent, ctx: Context) -> list[Signal]:
-        if event.timeframe != "1Day":
+        if event.timeframe != self.timeframe:
             return []
 
         store = ctx.bar_store
-        df = store.get_bars(event.symbol, "1Day", event.asset_class)
+        df = store.get_bars(event.symbol, self.timeframe, event.asset_class)
         if df is None or len(df) < 30:
             return []
 

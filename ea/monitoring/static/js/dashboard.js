@@ -1,13 +1,12 @@
-/* EA dashboard — vanilla JS frontend.
-   Live updates via SSE (/api/stream). REST polls for non-tick data. */
+/* QuantTrader.AI dashboard — TradingView-style frontend */
 
 (() => {
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-  const fmtUSD = (v, decimals = 2) =>
-    v == null ? "$ —" :
-    "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const fmtUSD = (v, d = 2) =>
+    v == null ? "$—" :
+    "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
   const fmtNum = (v, d = 4) =>
     v == null ? "—" :
     Number(v).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: d });
@@ -19,285 +18,458 @@
     const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
     return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
   };
+  const fmtTime = (iso) => {
+    if (!iso) return "—";
+    try { return new Date(iso).toISOString().substring(11, 19); } catch { return "—"; }
+  };
+  const escapeHtml = (s) =>
+    (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 
   const state = {
-    selectedSymbol: null,
+    selectedSymbol: "SPY",
     chart: null,
     candleSeries: null,
     watchlist: [],
-    streams: {},            // asset_class -> status
-    latestBars: new Map(),  // symbol -> latest bar payload
+    streams: {},
+    timeframe: "1Day",
+    tradeSide: "buy",
   };
 
   /* ---------- clock ---------- */
   function tickClock() {
     const d = new Date();
-    const pad = (n) => String(n).padStart(2, "0");
+    const pad = n => String(n).padStart(2, "0");
     $("#clock-utc").textContent =
-      `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+      `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
   }
-  setInterval(tickClock, 1000); tickClock();
+  setInterval(tickClock, 30000); tickClock();
 
   /* ---------- API ---------- */
   const api = {
     get: (url) => fetch(url).then(r => r.ok ? r.json() : Promise.reject(r.status)),
     post: (url, body) => fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: body ? JSON.stringify(body) : null,
     }).then(r => r.json().catch(() => ({}))),
-    del: (url) => fetch(url, { method: "DELETE" }).then(r => r.json()),
+    del: (url) => fetch(url, { method: "DELETE" }).then(r => r.json().catch(() => ({}))),
   };
 
-  /* ---------- panels ---------- */
+  /* ---------- LEFT NAV (views) ---------- */
+  $$(".nav-icon[data-view]").forEach(b => {
+    b.addEventListener("click", () => {
+      const target = b.dataset.view;
+      $$(".nav-icon").forEach(x => x.classList.remove("active"));
+      $$(".view").forEach(x => x.classList.remove("active"));
+      b.classList.add("active");
+      $(`.view[data-view-content="${target}"]`).classList.add("active");
+      if (target === "chart" && state.chart) {
+        const el = $("#chart");
+        state.chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+      }
+    });
+  });
+
+  /* ---------- BOTTOM TABS ---------- */
+  $$(".bt").forEach(b => {
+    b.addEventListener("click", () => {
+      const target = b.dataset.bt;
+      $$(".bt").forEach(x => x.classList.remove("active"));
+      $$(".bottom-content").forEach(x => x.classList.remove("active"));
+      b.classList.add("active");
+      $(`.bottom-content[data-bt-content="${target}"]`).classList.add("active");
+    });
+  });
+
+  /* ---------- TIMEFRAMES ---------- */
+  $$(".tf-btn").forEach(b => {
+    b.addEventListener("click", () => {
+      $$(".tf-btn").forEach(x => x.classList.remove("active"));
+      b.classList.add("active");
+      state.timeframe = b.dataset.tf;
+      // For now we always have 1Day in store; deeper TFs need stream/backfill on demand.
+      // Future: fetch /api/chart/{sym}?tf= and switch.
+      if (state.timeframe === "1Day") loadChart(state.selectedSymbol);
+      else $("#chart-meta").textContent = `${b.dataset.tf} not yet wired (showing 1D)`;
+    });
+  });
+
+  /* ---------- ACCOUNT ---------- */
   function renderAccount(a) {
     if (!a || a.error) {
-      $("#m-equity").textContent = "$ —";
-      $("#account-id").textContent = "broker offline";
+      $("#m-equity").textContent = "$—";
       return;
     }
-    $("#account-id").textContent = a.account_id.slice(0, 8) + "…";
     $("#m-equity").textContent = fmtUSD(a.equity);
     $("#m-cash").textContent = fmtUSD(a.cash);
-    $("#m-bp").textContent = fmtUSD(a.buying_power);
-    $("#m-pv").textContent = fmtUSD(a.portfolio_value);
-
     const pnl = a.pnl_today, pct = a.pnl_today_pct;
     const cls = pnl > 0.01 ? "up" : pnl < -0.01 ? "down" : "";
     const el = $("#m-pnl-today");
-    el.className = "metric-delta " + cls;
-    el.textContent = `P/L · ${pnl >= 0 ? "+" : ""}${fmtUSD(pnl, 2)} · ${fmtPct(pct)}`;
-
-    $("#f-pdt").classList.toggle("active", !!a.pattern_day_trader);
-    $("#f-blocked").classList.toggle("active", !!a.trading_blocked);
+    el.className = "acct-val " + cls;
+    el.textContent = `${pnl >= 0 ? "+" : ""}${fmtUSD(pnl)} (${fmtPct(pct)})`;
   }
 
-  function renderPositions(positions) {
-    $("#positions-count").textContent = `${positions.length} OPEN`;
+  /* ---------- POSITIONS ---------- */
+  function renderPositions(positions, ordersOpen) {
+    const n = positions.length;
+    $("#positions-count").textContent = n;
     const body = $("#positions-body");
-    if (!positions.length) {
-      body.innerHTML = `<tr class="placeholder"><td colspan="7">// no open positions //</td></tr>`;
-      $("#risk-pos-bar").style.width = "0%";
-      $("#risk-pos-meta").textContent = "0 / 15 max";
+    const hint = $("#positions-hint");
+    if (!n) {
+      body.innerHTML = `<tr class="placeholder"><td colspan="8">No open positions</td></tr>`;
+      const pendingCount = (ordersOpen || []).filter(o =>
+        ["new", "accepted", "pending", "partially_filled"].includes(o.status)).length;
+      hint.textContent = pendingCount > 0
+        ? `${pendingCount} pending order(s) — see Orders tab. They'll show here once filled.`
+        : "Submit a trade from the Scanner tab; the position will show here after the order fills.";
       return;
     }
+    hint.textContent = "";
     body.innerHTML = positions.map(p => {
       const pl = p.unrealized_pl;
       const cls = pl == null ? "" : pl >= 0 ? "pos-pl-up" : "pos-pl-down";
-      const plStr = pl == null ? "—" :
-        (pl >= 0 ? "+" : "") + fmtUSD(pl, 2) + " · " + fmtPct((p.unrealized_pl_pct || 0) * 100);
+      const plStr = pl == null ? "—" : (pl >= 0 ? "+" : "") + fmtUSD(pl);
+      const pctStr = p.unrealized_pl_pct != null ? fmtPct(p.unrealized_pl_pct * 100) : "—";
       return `<tr>
-        <td>${p.symbol}</td>
-        <td>${p.asset_class}</td>
-        <td class="num">${fmtNum(p.quantity)}</td>
+        <td><strong>${p.symbol}</strong></td>
+        <td class="num">${fmtNum(p.quantity, 4)}</td>
         <td class="num">${fmtUSD(p.avg_entry_price)}</td>
         <td class="num">${fmtUSD(p.current_price)}</td>
         <td class="num">${fmtUSD(p.market_value)}</td>
         <td class="num ${cls}">${plStr}</td>
+        <td class="num ${cls}">${pctStr}</td>
+        <td><button class="row-action pos-close-btn" data-sym="${p.symbol}">Close</button></td>
       </tr>`;
     }).join("");
+    $$(".pos-close-btn").forEach(b => b.addEventListener("click", () => closePosition(b.dataset.sym)));
 
-    const pct = Math.min(100, (positions.length / 15) * 100);
-    $("#risk-pos-bar").style.width = pct + "%";
-    $("#risk-pos-bar").classList.toggle("warn", pct >= 50 && pct < 80);
-    $("#risk-pos-bar").classList.toggle("danger", pct >= 80);
-    $("#risk-pos-meta").textContent = `${positions.length} / 15 max`;
+    // risk panel
+    const pct = Math.min(100, (n / 15) * 100);
+    if ($("#risk-pos-bar")) {
+      $("#risk-pos-bar").style.width = pct + "%";
+      $("#risk-pos-bar").classList.toggle("warn", pct >= 50 && pct < 80);
+      $("#risk-pos-bar").classList.toggle("danger", pct >= 80);
+      $("#risk-pos-meta").textContent = `${n} / 15`;
+    }
   }
 
-  function renderSystem(sys) {
-    $("#sys-tick").textContent = sys.tick != null ? `tick ${sys.tick}` : "tick —";
-    $("#sys-broker").textContent = (sys.broker || "—").toUpperCase();
-    $("#sys-profile").textContent = (sys.profile || "—").toUpperCase();
-    $("#sys-uptime").textContent = sys.uptime_seconds != null ? fmtDur(sys.uptime_seconds) : "—";
-    $("#sys-rows").textContent = (sys.store_rows ?? 0).toLocaleString();
-    $("#sys-stocks").textContent = sys.store_stock_symbols ?? 0;
-    $("#sys-crypto").textContent = sys.store_crypto_symbols ?? 0;
-    $("#sys-kill").textContent = sys.kill_switch_armed ? "ARMED" : "—";
-    $("#sys-kill").style.color = sys.kill_switch_armed ? "var(--red)" : "";
+  async function closePosition(symbol) {
+    if (!confirm(`Close ${symbol} via market order?`)) return;
+    const positions = await api.get("/api/positions");
+    const pos = positions.find(p => p.symbol === symbol);
+    if (!pos) return;
+    const r = await fetch("/api/order", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        symbol, side: pos.quantity > 0 ? "sell" : "buy",
+        quantity: Math.abs(pos.quantity), order_type: "market",
+      }),
+    });
+    if (r.ok) loadOrders();
+    else alert("Close failed");
+  }
 
+  /* ---------- ORDERS ---------- */
+  function renderOrders(orders) {
+    $("#orders-count").textContent = orders.length;
+    const body = $("#orders-body");
+    if (!orders.length) {
+      body.innerHTML = `<tr class="placeholder"><td colspan="8">No orders submitted yet</td></tr>`;
+      return;
+    }
+    body.innerHTML = orders.map(o => {
+      const ts = fmtTime(o.submitted_at);
+      const sideCls = o.side === "buy" ? "up" : "down";
+      const note = o.error ? `<span style="color:var(--sell)">${escapeHtml(o.error)}</span>`
+        : (o.filled_qty > 0 ? `Filled ${fmtNum(o.filled_qty, 2)} @ ${fmtUSD(o.avg_fill_price)}`
+        : (o.limit_price ? `Limit ${fmtUSD(o.limit_price)}` : ""));
+      const canCancel = o.order_id && ["new", "accepted", "pending", "partially_filled"].includes(o.status);
+      const action = canCancel
+        ? `<button class="row-action order-cancel-btn" data-id="${o.order_id}">Cancel</button>`
+        : "";
+      return `<tr>
+        <td class="num">${ts}</td>
+        <td><strong>${o.symbol}</strong></td>
+        <td class="${sideCls}">${o.side.toUpperCase()}</td>
+        <td class="num">${fmtNum(o.quantity, 2)}</td>
+        <td>${o.order_type}</td>
+        <td><span class="status-badge ${o.status}">${o.status}</span></td>
+        <td>${note}</td>
+        <td>${action}</td>
+      </tr>`;
+    }).join("");
+    $$(".order-cancel-btn").forEach(b => b.addEventListener("click", async () => {
+      const r = await fetch(`/api/orders/${b.dataset.id}`, {method: "DELETE"});
+      if (r.ok) loadOrders();
+      else {
+        const data = await r.json().catch(() => ({}));
+        alert(`Cancel failed: ${data.detail || r.status}`);
+        loadOrders();
+      }
+    }));
+  }
+
+  /* ---------- SYSTEM ---------- */
+  function renderSystem(sys) {
+    if ($("#sys-broker")) $("#sys-broker").textContent = (sys.broker || "—").toUpperCase();
+    if ($("#sys-uptime")) $("#sys-uptime").textContent = sys.uptime_seconds != null ? fmtDur(sys.uptime_seconds) : "—";
+    if ($("#sys-rows")) $("#sys-rows").textContent = (sys.store_rows ?? 0).toLocaleString();
+    if ($("#sys-stocks")) $("#sys-stocks").textContent = sys.store_stock_symbols ?? 0;
+    if ($("#sys-crypto")) $("#sys-crypto").textContent = sys.store_crypto_symbols ?? 0;
+    if ($("#sys-kill")) {
+      $("#sys-kill").textContent = sys.kill_switch_armed ? "ARMED" : "—";
+      $("#sys-kill").style.color = sys.kill_switch_armed ? "var(--sell)" : "";
+    }
+    if (sys.scanner && $("#sys-scanner")) {
+      $("#sys-scanner").textContent = `${sys.scanner.scans_completed || 0} scans · ${sys.scanner.in_zone || 0} in-zone (${sys.scanner.mode})`;
+    }
+    if (sys.news_poller && $("#sys-news")) {
+      $("#sys-news").textContent = `${sys.news_poller.total_published || 0} published`;
+    }
     state.streams = sys.streams || {};
     renderStreamButtons();
-
-    $("#connection-label").textContent = "LINK · OK";
+    if ($("#autosubmit-toggle")) $("#autosubmit-toggle").checked = !!sys.autosubmit;
   }
 
   function renderStreamButtons() {
     const cryptoOn = !!state.streams["crypto"]?.running;
     const stockOn = !!state.streams["stock"]?.running;
-    const cb = $("#btn-stream-crypto");
-    const sb = $("#btn-stream-stock");
-    cb.textContent = cryptoOn ? "● LIVE · CRYPTO" : "◉ STREAM · CRYPTO";
-    cb.style.color = cryptoOn ? "var(--lime)" : "";
-    cb.style.borderColor = cryptoOn ? "var(--lime)" : "";
-    sb.textContent = stockOn ? "● LIVE · STOCK" : "◉ STREAM · STOCK";
-    sb.style.color = stockOn ? "var(--lime)" : "";
-    sb.style.borderColor = stockOn ? "var(--lime)" : "";
+    $("#btn-stream-crypto").classList.toggle("on", cryptoOn);
+    $("#btn-stream-crypto").textContent = cryptoOn ? "● Crypto" : "⊕ Crypto";
+    $("#btn-stream-stock").classList.toggle("on", stockOn);
+    $("#btn-stream-stock").textContent = stockOn ? "● Stock" : "⊕ Stock";
   }
 
+  /* ---------- ALERTS / EVENT LOG ---------- */
   function renderAlerts(alerts) {
     $("#alerts-count").textContent = alerts.length;
-    const log = $("#event-log");
-    if (!alerts.length) {
-      log.innerHTML = `<li class="placeholder">// awaiting events //</li>`;
-      return;
-    }
-    log.innerHTML = alerts.map(a => {
-      const t = new Date(a.timestamp);
-      const ts = t.toISOString().substring(11, 19);
-      return `<li>
-        <span class="event-time">${ts}</span>
-        <span class="event-level ${a.level}">${a.level.toUpperCase()}</span>
-        <span class="event-msg">${a.message}</span>
-      </li>`;
-    }).join("");
+    const html = !alerts.length
+      ? `<li class="placeholder">Awaiting events</li>`
+      : alerts.map(a => `
+        <li>
+          <span class="event-time">${fmtTime(a.timestamp)}</span>
+          <span class="event-level ${a.level}">${a.level}</span>
+          <span class="event-msg">${escapeHtml(a.message)}</span>
+        </li>`).join("");
+    $("#event-log").innerHTML = html;
+    if ($("#event-log-monitor")) $("#event-log-monitor").innerHTML = html;
   }
 
+  /* ---------- WATCHLIST ---------- */
   function renderWatchlist(wl) {
     state.watchlist = wl;
     const list = $("#watchlist-list");
     if (!wl.length) {
-      list.innerHTML = `<li class="placeholder">// empty //</li>`;
+      list.innerHTML = `<li class="placeholder">Empty</li>`;
       return;
     }
     list.innerHTML = wl.map(w => {
       const chg = w.change_pct;
       const chgCls = chg == null ? "" : chg >= 0 ? "up" : "down";
       const chgStr = chg == null ? "—" : fmtPct(chg);
-      const liveDot = w.live ? `<span class="live-dot" title="live"></span>` : "";
+      const liveDot = w.live ? `<span class="live-dot"></span>` : "";
+      const safe = w.symbol.replace("/", "_");
       return `<li data-sym="${w.symbol}" class="${state.selectedSymbol === w.symbol ? "active" : ""}">
         <div>
-          <div class="wl-sym">${liveDot}${w.symbol}</div>
-          <div class="wl-px" id="wl-px-${w.symbol.replace("/","_")}">${w.last == null ? "—" : fmtUSD(w.last)}</div>
+          <div class="wl-sym-row">${liveDot}<span class="wl-sym">${w.symbol}</span></div>
+          <div class="wl-chg ${chgCls}" id="wl-chg-${safe}">${chgStr}</div>
         </div>
-        <div style="text-align:right">
-          <div class="wl-chg ${chgCls}" id="wl-chg-${w.symbol.replace("/","_")}">${chgStr}</div>
-          <button class="wl-del" data-sym="${w.symbol}" title="Remove">×</button>
+        <div>
+          <div class="wl-px" id="wl-px-${safe}">${w.last == null ? "—" : fmtUSD(w.last)}</div>
         </div>
+        <button class="wl-del" data-sym="${w.symbol}">×</button>
       </li>`;
     }).join("");
 
-    // wire clicks
     $$(".watchlist li[data-sym]").forEach(li => {
-      li.addEventListener("click", (e) => {
+      li.addEventListener("click", e => {
         if (e.target.classList.contains("wl-del")) return;
-        const sym = li.dataset.sym;
-        state.selectedSymbol = sym;
-        loadChart(sym);
-        renderWatchlist(state.watchlist); // re-render to update active
+        state.selectedSymbol = li.dataset.sym;
+        loadChart(state.selectedSymbol);
+        renderWatchlist(state.watchlist);
+        // Also switch to chart view if not already
+        $$(".nav-icon").forEach(n => n.classList.remove("active"));
+        $(`.nav-icon[data-view="chart"]`).classList.add("active");
+        $$(".view").forEach(v => v.classList.remove("active"));
+        $(`.view[data-view-content="chart"]`).classList.add("active");
       });
     });
     $$(".wl-del").forEach(btn => {
-      btn.addEventListener("click", async (e) => {
+      btn.addEventListener("click", async e => {
         e.stopPropagation();
-        const sym = btn.dataset.sym;
-        const r = await api.del(`/api/watchlist/${sym}`);
-        if (state.selectedSymbol === sym) state.selectedSymbol = null;
+        await api.del(`/api/watchlist/${encodeURIComponent(btn.dataset.sym)}`);
+        if (state.selectedSymbol === btn.dataset.sym) state.selectedSymbol = wl[0]?.symbol || "SPY";
         loadWatchlist();
       });
     });
 
-    // Auto-select first if nothing chosen yet
-    if (!state.selectedSymbol && wl[0]?.last != null) {
-      state.selectedSymbol = wl[0].symbol;
-      loadChart(wl[0].symbol);
+    // Update header symbol bar from selected
+    const sel = wl.find(w => w.symbol === state.selectedSymbol) || wl[0];
+    if (sel) {
+      state.selectedSymbol = sel.symbol;
+      $("#sym-name").textContent = sel.symbol;
+      $("#sym-price").textContent = sel.last == null ? "—" : fmtUSD(sel.last);
+      const chg = sel.change_pct;
+      $("#sym-change").textContent = chg == null ? "" : fmtPct(chg);
+      $("#sym-change").className = "sym-change " + (chg == null ? "" : chg >= 0 ? "up" : "down");
     }
+
+    // Auto-load chart on first paint
+    if (!state.chart && sel?.last != null) loadChart(sel.symbol);
   }
 
-  /* ---------- chart ---------- */
+  /* ---------- CHART ---------- */
   function ensureChart() {
     if (state.chart) return;
     const el = $("#chart");
     state.chart = LightweightCharts.createChart(el, {
-      width: el.clientWidth,
-      height: el.clientHeight,
-      layout: {
-        background: { type: "solid", color: "transparent" },
-        textColor: "#8995c4",
-        fontFamily: "JetBrains Mono",
-      },
-      grid: {
-        vertLines: { color: "#1a234744" },
-        horzLines: { color: "#1a234744" },
-      },
+      width: el.clientWidth, height: el.clientHeight,
+      layout: { background: { type: "solid", color: "#131722" }, textColor: "#787b86", fontFamily: "Inter, sans-serif", fontSize: 11 },
+      grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
       crosshair: { mode: 0 },
-      rightPriceScale: { borderColor: "#1a2347" },
-      timeScale: { borderColor: "#1a2347", timeVisible: true },
+      rightPriceScale: { borderColor: "#363a45" },
+      timeScale: { borderColor: "#363a45", timeVisible: true },
     });
     state.candleSeries = state.chart.addCandlestickSeries({
-      upColor: "#00ff88", downColor: "#ff3b30",
-      borderUpColor: "#00ff88", borderDownColor: "#ff3b30",
-      wickUpColor: "#00ff88", wickDownColor: "#ff3b30",
+      upColor: "#26a69a", downColor: "#ef5350",
+      borderUpColor: "#26a69a", borderDownColor: "#ef5350",
+      wickUpColor: "#26a69a", wickDownColor: "#ef5350",
     });
-    window.addEventListener("resize", () => {
-      if (state.chart) state.chart.applyOptions({ width: el.clientWidth });
-    });
+    new ResizeObserver(() => {
+      if (!state.chart) return;
+      state.chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+    }).observe(el);
   }
 
   async function loadChart(symbol) {
+    if (!symbol) return;
     ensureChart();
     $("#chart-title").textContent = symbol;
     $("#chart-meta").textContent = "loading…";
     try {
-      const data = await api.get(`/api/chart/${symbol}?limit=200`);
+      const data = await api.get(`/api/chart/${encodeURIComponent(symbol)}?limit=200`);
       state.candleSeries.setData(data.bars);
       state.chart.timeScale().fitContent();
-      $("#chart-meta").textContent = `${data.bars.length} bars · 1D · stock`;
+      $("#chart-meta").textContent = `${data.bars.length} bars · 1D`;
     } catch (e) {
-      $("#chart-meta").textContent = "no data · backfill required";
+      $("#chart-meta").textContent = "no data — run backfill first";
       state.candleSeries.setData([]);
     }
   }
 
-  /* ---------- loads ---------- */
-  async function loadAccount()    { renderAccount(await api.get("/api/account")); }
-  async function loadPositions()  { renderPositions(await api.get("/api/positions")); }
-  async function loadAlerts()     { renderAlerts(await api.get("/api/alerts")); }
-  async function loadWatchlist()  { renderWatchlist(await api.get("/api/watchlist")); }
-  async function loadNews()       { renderNews(await api.get("/api/news")); }
-  async function loadSignals()    { renderSignals(await api.get("/api/signals")); }
-  async function loadStrategies() { renderStrategies(await api.get("/api/strategies")); }
-  async function loadRisk()       { renderRisk(await api.get("/api/risk"), await api.get("/api/orders")); }
-  async function loadScanner() {
-    const f = $("#scanner-filter").value;
-    const c = $("#scanner-class").value;
-    const qs = new URLSearchParams();
-    if (f) qs.set("status_filter", f);
-    if (c) qs.set("asset_class", c);
-    const rows = await api.get("/api/scanner/results?" + qs.toString());
-    renderScanner(rows);
-    try {
-      const st = await api.get("/api/scanner/status");
-      $("#scanner-sub").textContent = `${st.scans_completed || 0} scans · ${st.in_zone || 0} in-zone · ${st.setups_found || 0} total`;
-    } catch (_) {}
+  /* ---------- NEWS / SIGNALS / RISK ---------- */
+  function renderNews(items) {
+    const list = $("#news-list");
+    if (!items.length) {
+      list.innerHTML = `<li class="placeholder">Awaiting news</li>`;
+      return;
+    }
+    list.innerHTML = items.map(n => {
+      const hm = fmtTime(n.published_at).substring(0, 5);
+      const src = (n.source_name || n.source || "").toUpperCase();
+      const tickers = (n.tickers || []).map(x => `<span class="news-ticker">${x}</span>`).join("");
+      return `<li>
+        <div class="news-time">${hm}</div>
+        <div>
+          <div class="news-title">${tickers}<a href="${n.url}" target="_blank" rel="noopener">${escapeHtml(n.title)}</a></div>
+          <div class="news-meta">${src}</div>
+        </div>
+      </li>`;
+    }).join("");
+  }
+
+  function renderSignals(items) {
+    $("#signals-count").textContent = items.length;
+    const list = $("#signals-list");
+    if (!items.length) {
+      list.innerHTML = `<li class="placeholder">No signals yet</li>`;
+      return;
+    }
+    list.innerHTML = items.map(s => {
+      const cls = s.submitted ? "submitted" : (s.accepted ? "accepted" : "rejected");
+      const sideCls = s.side === "long" ? "long" : (s.side === "short" ? "short" : "");
+      const conv = (s.conviction || 0).toFixed(2);
+      const status = s.submitted ? `Sent · ${s.order_status || ''}` : (s.accepted ? "Accepted" : `Rejected · ${s.reason || ''}`);
+      return `<li class="${cls}">
+        <span class="sig-side ${sideCls}">${(s.side || '').toUpperCase()}</span>
+        <span><strong>${s.symbol}</strong></span>
+        <span class="sig-meta">${s.strategy} · c=${conv} · ${escapeHtml(s.rationale || '')}</span>
+        <span class="sig-meta">${status}</span>
+      </li>`;
+    }).join("");
+  }
+
+  function renderStrategies(items) {
+    const row = $("#strategies-row");
+    row.innerHTML = items.map(s =>
+      `<button class="strategy-chip ${s.enabled ? 'on' : ''}" data-name="${s.name}">${s.name}</button>`
+    ).join("");
+    $$(".strategy-chip").forEach(b => {
+      b.addEventListener("click", async () => {
+        const on = b.classList.contains("on");
+        await fetch(`/api/strategies/${b.dataset.name}/${on ? 'pause' : 'resume'}`, { method: "POST" });
+        loadStrategies();
+      });
+    });
+  }
+
+  function renderRisk(risk) {
+    const dl = risk.daily_loss_pct || 0, wl = risk.weekly_loss_pct || 0;
+    setRiskBar("risk-daily-bar", Math.min(100, (dl / 2.0) * 100), risk.daily_halted);
+    setRiskBar("risk-weekly-bar", Math.min(100, (wl / 5.0) * 100), risk.weekly_halted);
+    if ($("#risk-daily-meta")) $("#risk-daily-meta").textContent = `${dl.toFixed(2)}% / 2%`;
+    if ($("#risk-weekly-meta")) $("#risk-weekly-meta").textContent = `${wl.toFixed(2)}% / 5%`;
+    if ($("#risk-status")) {
+      $("#risk-status").textContent = (risk.daily_halted || risk.weekly_halted) ? "HALTED" : "OK";
+      $("#risk-status").style.color = (risk.daily_halted || risk.weekly_halted) ? "var(--sell)" : "";
+    }
+  }
+
+  function setRiskBar(id, pct, halted) {
+    const el = $(`#${id}`);
+    if (!el) return;
+    el.style.width = pct + "%";
+    el.classList.remove("warn", "danger");
+    if (halted || pct >= 90) el.classList.add("danger");
+    else if (pct >= 50) el.classList.add("warn");
+  }
+
+  /* ---------- SCANNER ---------- */
+  function renderScannerStats(s) {
+    $("#ss-scans").textContent = s.scans_completed || 0;
+    $("#ss-inzone").textContent = s.in_zone || 0;
+    $("#ss-approach").textContent = s.approaching || 0;
+    $("#ss-watching").textContent = s.watching || 0;
+    $("#ss-universe").textContent = s.universe_size || 0;
+    $("#ss-last").textContent = s.last_scan_at ? fmtTime(s.last_scan_at) : "—";
+    if ($("#scanner-mode").value !== s.mode) $("#scanner-mode").value = s.mode;
   }
 
   function renderScanner(rows) {
     const body = $("#scanner-body");
     if (!rows || !rows.length) {
-      body.innerHTML = `<tr class="placeholder"><td colspan="13">// no setups match filter //</td></tr>`;
+      body.innerHTML = `<tr class="placeholder"><td colspan="13">No setups match filter — try lowering filter or clicking Scan now</td></tr>`;
       return;
     }
     body.innerHTML = rows.map(r => {
       const sideCls = r.side === "bullish" ? "bullish" : "bearish";
-      const sideArrow = r.side === "bullish" ? "▲" : "▼";
       const conf = (r.confluence || []).join(" · ");
       const distStr = r.distance_pct >= 0 ? `+${r.distance_pct.toFixed(2)}%` : `${r.distance_pct.toFixed(2)}%`;
       const isForex = r.asset_class === "forex";
       const tradeBtn = isForex
-        ? `<button class="scan-trade-btn" disabled title="OANDA required (Phase C)">FOREX</button>`
-        : `<button class="scan-trade-btn" data-payload='${JSON.stringify(r).replace(/'/g, "&apos;")}'>TRADE</button>`;
+        ? `<button class="scan-trade-btn" disabled title="OANDA required">Forex</button>`
+        : `<button class="scan-trade-btn" data-payload='${JSON.stringify(r).replace(/'/g, "&apos;")}'>Trade</button>`;
       return `<tr>
         <td><strong>${r.symbol}</strong></td>
         <td>${r.asset_class}</td>
-        <td class="scan-side ${sideCls}">${sideArrow} ${r.side.toUpperCase()}</td>
+        <td class="scan-side ${sideCls}">${r.side === "bullish" ? "▲ Long" : "▼ Short"}</td>
         <td>${r.zone_kind}</td>
         <td class="num">${fmtUSD(r.current_price)}</td>
-        <td class="num">${fmtUSD(r.entry_low)}–${fmtUSD(r.entry_high).replace("$", "")}</td>
+        <td class="num">${fmtUSD(r.entry_low)} – ${fmtUSD(r.entry_high).replace("$", "")}</td>
         <td class="num">${fmtUSD(r.stop)}</td>
         <td class="num">${fmtUSD(r.target)}</td>
         <td class="num">${r.risk_reward.toFixed(1)}x</td>
         <td class="num">${distStr}</td>
-        <td><span class="scan-status ${r.status}">${r.status.replace("_", " ").toUpperCase()}</span></td>
+        <td><span class="scan-status ${r.status}">${r.status.replace("_", " ")}</span></td>
         <td class="scan-confluence">${conf}</td>
         <td>${tradeBtn}</td>
       </tr>`;
@@ -309,14 +481,14 @@
 
   function openTradeModal(setup) {
     const m = $("#trade-modal");
-    $("#trade-modal-title").textContent = `${setup.symbol} · ${setup.side.toUpperCase()}`;
+    $("#trade-modal-title").textContent = `Trade ${setup.symbol}`;
     $("#trade-modal-meta").innerHTML = `
-      <strong>${setup.zone_kind}</strong> ${setup.confluence.join(" · ")}<br>
-      Current ${fmtUSD(setup.current_price)} · Entry ${fmtUSD(setup.entry_low)}–${fmtUSD(setup.entry_high).replace("$","")}<br>
-      Stop ${fmtUSD(setup.stop)} · Target ${fmtUSD(setup.target)} · R:R ${setup.risk_reward.toFixed(1)}x
+      <div><strong>${setup.zone_kind}</strong> · ${setup.confluence.join(" · ")}</div>
+      <div>Current: <strong>${fmtUSD(setup.current_price)}</strong> · Entry zone ${fmtUSD(setup.entry_low)}–${fmtUSD(setup.entry_high).replace("$","")}</div>
+      <div>Stop ${fmtUSD(setup.stop)} · Target ${fmtUSD(setup.target)} · R:R <strong>${setup.risk_reward.toFixed(1)}x</strong></div>
     `;
-    $("#trade-side").value = setup.side === "bullish" ? "buy" : "sell";
-    // Default qty: $500 risk-equivalent at entry mid
+    state.tradeSide = setup.side === "bullish" ? "buy" : "sell";
+    setSideButtons(state.tradeSide);
     const entryMid = (setup.entry_low + setup.entry_high) / 2;
     const risk = Math.abs(entryMid - setup.stop);
     const dollarRisk = 50;
@@ -330,222 +502,90 @@
     m.classList.remove("hidden");
   }
 
-  function renderSignals(items) {
-    $("#signals-count").textContent = items.length;
-    const list = $("#signals-list");
-    if (!items.length) {
-      list.innerHTML = `<li class="placeholder">// no signals yet //</li>`;
-      return;
-    }
-    list.innerHTML = items.map(s => {
-      const cls = s.submitted ? "submitted" : (s.accepted ? "accepted" : "rejected");
-      const sideCls = s.side === "long" ? "long" : (s.side === "short" ? "short" : "");
-      const conv = (s.conviction || 0).toFixed(2);
-      const status = s.submitted ? `SENT · ${s.order_status || ''}` : (s.accepted ? "ACCEPT" : `REJECT · ${s.reason || ''}`);
-      return `<li class="${cls}">
-        <span class="sig-side ${sideCls}">${(s.side || '').toUpperCase()}</span>
-        <span><strong>${s.symbol}</strong></span>
-        <span class="sig-meta">${s.strategy} · c=${conv} · ${s.rationale || ''}</span>
-        <span class="sig-meta">${status}</span>
-      </li>`;
-    }).join("");
+  function setSideButtons(side) {
+    $$(".side-btn").forEach(b => b.classList.toggle("active", b.dataset.side === side));
   }
+  $$(".side-btn").forEach(b => b.addEventListener("click", () => {
+    state.tradeSide = b.dataset.side;
+    setSideButtons(state.tradeSide);
+  }));
 
-  function renderStrategies(items) {
-    const row = $("#strategies-row");
-    row.innerHTML = items.map(s =>
-      `<button class="strategy-chip ${s.enabled ? 'on' : 'off'}" data-name="${s.name}">${s.name.toUpperCase()}</button>`
-    ).join("");
-    $$(".strategy-chip").forEach(b => {
-      b.addEventListener("click", async () => {
-        const name = b.dataset.name;
-        const on = b.classList.contains("on");
-        await fetch(`/api/strategies/${name}/${on ? 'pause' : 'resume'}`, { method: "POST" });
-        loadStrategies();
-      });
-    });
+  /* ---------- LOADERS ---------- */
+  let _ordersCache = [];
+  async function loadAccount()    { renderAccount(await api.get("/api/account")); }
+  async function loadPositions()  { renderPositions(await api.get("/api/positions"), _ordersCache); }
+  async function loadOrders()     {
+    const orders = await api.get("/api/orders");
+    _ordersCache = orders;
+    renderOrders(orders);
+    renderPositions(await api.get("/api/positions"), orders);
   }
-
-  function renderRisk(risk, orders) {
-    const profile = state.streams; // reused
-    const dl = risk.daily_loss_pct || 0, wl = risk.weekly_loss_pct || 0;
-    const dailyLimit = 2.0, weeklyLimit = 5.0;
-    const dPct = Math.min(100, (dl / dailyLimit) * 100);
-    const wPct = Math.min(100, (wl / weeklyLimit) * 100);
-    setRiskBar("risk-daily-bar", dPct, risk.daily_halted);
-    setRiskBar("risk-weekly-bar", wPct, risk.weekly_halted);
-    $("#risk-daily-meta").textContent = `${dl.toFixed(2)}% of ${dailyLimit}% limit`;
-    $("#risk-weekly-meta").textContent = `${wl.toFixed(2)}% of ${weeklyLimit}% limit`;
-    $("#risk-status").textContent = (risk.daily_halted || risk.weekly_halted) ? "HALTED" : "OK";
-    $("#risk-status").style.color = (risk.daily_halted || risk.weekly_halted) ? "var(--red)" : "";
-
-    const submitted = (orders || []).filter(o => o.status !== "failed").length;
-    const failed = (orders || []).filter(o => o.status === "failed").length;
-    const total = (orders || []).length || 1;
-    setRiskBar("risk-orders-bar", (submitted / total) * 100, false);
-    $("#risk-orders-meta").textContent = `${submitted} submitted · ${failed} failed`;
-  }
-
-  function setRiskBar(id, pct, halted) {
-    const el = $(`#${id}`);
-    if (!el) return;
-    el.style.width = pct + "%";
-    el.classList.remove("warn", "danger");
-    if (halted || pct >= 90) el.classList.add("danger");
-    else if (pct >= 50) el.classList.add("warn");
-  }
-
-  function renderNews(items) {
-    $("#news-count").textContent = items.length;
-    const list = $("#news-list");
-    if (!items.length) {
-      list.innerHTML = `<li class="placeholder">// awaiting news //</li>`;
-      return;
-    }
-    list.innerHTML = items.map(n => {
-      const t = new Date(n.published_at);
-      const hm = t.toISOString().substring(11, 16);
-      const src = (n.source_name || n.source || "").toUpperCase();
-      const tickers = (n.tickers || []).map(x => `<span class="news-ticker">${x}</span>`).join("");
-      return `<li>
-        <div class="news-time">${hm}</div>
-        <div class="news-body">
-          <div class="news-title">${tickers}<a href="${n.url}" target="_blank" rel="noopener">${escapeHtml(n.title)}</a></div>
-          <div class="news-meta">${src}</div>
-        </div>
-      </li>`;
-    }).join("");
-  }
-
-  function escapeHtml(s) {
-    return (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+  async function loadAlerts()     { renderAlerts(await api.get("/api/alerts")); }
+  async function loadWatchlist()  { renderWatchlist(await api.get("/api/watchlist")); }
+  async function loadNews()       { renderNews(await api.get("/api/news")); }
+  async function loadSignals()    { renderSignals(await api.get("/api/signals")); }
+  async function loadStrategies() { renderStrategies(await api.get("/api/strategies")); }
+  async function loadRisk()       { renderRisk(await api.get("/api/risk")); }
+  async function loadScanner() {
+    const f = $("#scanner-filter").value, c = $("#scanner-class").value;
+    const qs = new URLSearchParams();
+    if (f) qs.set("status_filter", f);
+    if (c) qs.set("asset_class", c);
+    const [rows, st] = await Promise.all([
+      api.get("/api/scanner/results?" + qs.toString()),
+      api.get("/api/scanner/status"),
+    ]);
+    renderScanner(rows);
+    renderScannerStats(st);
   }
 
   async function refreshAll() {
     await Promise.allSettled([
-      loadAccount(), loadPositions(), loadAlerts(), loadWatchlist(), loadNews(),
+      loadAccount(), loadOrders(), loadAlerts(), loadWatchlist(), loadNews(),
       loadSignals(), loadStrategies(), loadRisk(), loadScanner(),
     ]);
-    // sync autosubmit toggle from system snapshot
-    try {
-      const sys = await api.get("/api/system");
-      $("#autosubmit-toggle").checked = !!sys.autosubmit;
-    } catch (_) {}
   }
 
   /* ---------- SSE ---------- */
   function applyLiveBar(b) {
-    state.latestBars.set(b.symbol, b);
     const safe = b.symbol.replace("/", "_");
     const px = $(`#wl-px-${safe}`);
     if (px) px.textContent = fmtUSD(b.close);
-
-    // If this bar belongs to the active chart symbol, update the candle
-    if (state.selectedSymbol === b.symbol && state.candleSeries) {
-      state.candleSeries.update({
-        time: b.time,
-        open: b.open, high: b.high, low: b.low, close: b.close,
-      });
+    if (state.selectedSymbol === b.symbol) {
+      $("#sym-price").textContent = fmtUSD(b.close);
+      if (state.candleSeries) {
+        state.candleSeries.update({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close });
+      }
     }
   }
 
   function startSSE() {
     const ev = new EventSource("/api/stream");
-    ev.addEventListener("snapshot", (e) => {
+    ev.addEventListener("snapshot", e => {
       try {
         const p = JSON.parse(e.data);
         if (p.system) renderSystem(p.system);
         if (p.account) renderAccount(p.account);
-      } catch (err) { console.warn("bad sse payload", err); }
+      } catch (err) { console.warn("bad sse", err); }
     });
-    ev.addEventListener("bar", (e) => {
-      try {
-        const b = JSON.parse(e.data);
-        applyLiveBar(b);
-      } catch (err) { console.warn("bad bar payload", err); }
+    ev.addEventListener("bar", e => {
+      try { applyLiveBar(JSON.parse(e.data)); } catch (_) {}
     });
-    ev.addEventListener("news", () => { loadNews(); });
-    ev.onerror = () => {
-      $("#connection-label").textContent = "LINK · RETRY";
-      $("#connection-pill .dot").style.background = "var(--amber)";
-    };
-    ev.onopen = () => {
-      $("#connection-label").textContent = "LINK · OK";
-      $("#connection-pill .dot").style.background = "var(--cyan)";
-    };
+    ev.addEventListener("news", () => loadNews());
+    ev.onerror = () => $("#connection-dot").style.background = "var(--warn)";
+    ev.onopen  = () => $("#connection-dot").style.background = "var(--buy)";
   }
 
   async function toggleStream(assetClass) {
     const on = !!state.streams[assetClass]?.running;
-    if (on) {
-      await fetch(`/api/stream/stop?asset_class=${assetClass}`, { method: "POST" });
-    } else {
-      await api.post("/api/stream/start", { asset_class: assetClass });
-    }
+    if (on) await fetch(`/api/stream/stop?asset_class=${assetClass}`, { method: "POST" });
+    else await api.post("/api/stream/start", { asset_class: assetClass });
     setTimeout(refreshAll, 400);
   }
 
-  /* ---------- controls ---------- */
-  $("#btn-refresh").addEventListener("click", refreshAll);
+  /* ---------- CONTROL HANDLERS ---------- */
   $("#btn-stream-crypto").addEventListener("click", () => toggleStream("crypto"));
   $("#btn-stream-stock").addEventListener("click", () => toggleStream("stock"));
-  $("#btn-news-poll").addEventListener("click", async () => {
-    await fetch("/api/news/poll", { method: "POST" });
-    setTimeout(loadNews, 400);
-  });
-
-  $("#autosubmit-toggle").addEventListener("change", async (e) => {
-    const on = e.target.checked;
-    await fetch(`/api/autosubmit?enabled=${on}`, { method: "POST" });
-  });
-
-  $("#btn-scan-now").addEventListener("click", async () => {
-    $("#btn-scan-now").textContent = "...SCANNING";
-    try {
-      await fetch("/api/scanner/scan-now", { method: "POST" });
-      await loadScanner();
-    } finally {
-      $("#btn-scan-now").textContent = "⟳ SCAN";
-    }
-  });
-  $("#scanner-filter").addEventListener("change", loadScanner);
-  $("#scanner-class").addEventListener("change", loadScanner);
-
-  $("#trade-cancel").addEventListener("click", () => $("#trade-modal").classList.add("hidden"));
-  $("#trade-submit").addEventListener("click", async () => {
-    const m = $("#trade-modal");
-    const symbol = m.dataset.symbol;
-    if (m.dataset.assetClass === "forex") {
-      alert("Forex execution requires OANDA configuration (Phase C).");
-      return;
-    }
-    const body = {
-      symbol,
-      side: $("#trade-side").value,
-      quantity: parseFloat($("#trade-qty").value),
-      order_type: $("#trade-type").value,
-    };
-    if (body.order_type === "limit") {
-      body.limit_price = parseFloat($("#trade-limit").value);
-    }
-    try {
-      const r = await fetch("/api/order", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(body),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (r.ok) {
-        alert(`Order submitted: ${data.order_id || ""} (${data.status || ""})`);
-        m.classList.add("hidden");
-        loadPositions(); loadAlerts();
-      } else {
-        alert(`Order rejected: ${data.detail || data.error || r.status}`);
-      }
-    } catch (e) {
-      alert(`Network error: ${e.message}`);
-    }
-  });
 
   $("#wl-add").addEventListener("click", async () => {
     const input = $("#wl-input");
@@ -555,21 +595,99 @@
     input.value = "";
     loadWatchlist();
   });
-  $("#wl-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#wl-add").click(); });
+  $("#wl-input").addEventListener("keydown", e => { if (e.key === "Enter") $("#wl-add").click(); });
 
   $("#btn-kill").addEventListener("click", () => $("#kill-modal").classList.remove("hidden"));
   $("#kill-cancel").addEventListener("click", () => $("#kill-modal").classList.add("hidden"));
+  $("#kill-cancel-2").addEventListener("click", () => $("#kill-modal").classList.add("hidden"));
   $("#kill-confirm").addEventListener("click", async () => {
     $("#kill-modal").classList.add("hidden");
     await api.post("/api/kill");
-    loadAlerts();
+    loadAlerts(); loadOrders();
   });
 
-  /* ---------- boot ---------- */
+  $("#btn-news-poll").addEventListener("click", async () => {
+    await fetch("/api/news/poll", { method: "POST" });
+    setTimeout(loadNews, 400);
+  });
+  if ($("#btn-news-poll-2")) $("#btn-news-poll-2").addEventListener("click", async () => {
+    await fetch("/api/news/poll", { method: "POST" });
+    setTimeout(loadNews, 400);
+  });
+
+  $("#autosubmit-toggle").addEventListener("change", async e => {
+    await fetch(`/api/autosubmit?enabled=${e.target.checked}`, { method: "POST" });
+  });
+
+  $("#btn-scan-now").addEventListener("click", async () => {
+    const btn = $("#btn-scan-now"); const orig = btn.textContent;
+    btn.textContent = "Scanning…"; btn.disabled = true;
+    try {
+      await fetch("/api/scanner/scan-now", { method: "POST" });
+      await loadScanner();
+    } finally { btn.textContent = orig; btn.disabled = false; }
+  });
+  $("#scanner-filter").addEventListener("change", loadScanner);
+  $("#scanner-class").addEventListener("change", loadScanner);
+  $("#scanner-mode").addEventListener("change", async e => {
+    await fetch(`/api/scanner/mode?mode=${e.target.value}`, { method: "POST" });
+    await loadScanner();
+  });
+
+  if ($("#btn-trade-current")) $("#btn-trade-current").addEventListener("click", () => {
+    // Open trade modal pre-filled for the currently selected symbol with no scanner setup
+    const sym = state.selectedSymbol;
+    const sel = state.watchlist.find(w => w.symbol === sym);
+    const px = sel?.last || 0;
+    openTradeModal({
+      symbol: sym, asset_class: sym.includes("/") ? "crypto" : "stock",
+      side: "bullish", zone_kind: "Manual",
+      confluence: ["Manual entry"],
+      current_price: px, entry_low: px * 0.99, entry_high: px,
+      stop: px * 0.97, target: px * 1.03, risk_reward: 2.0,
+    });
+  });
+
+  $("#trade-cancel").addEventListener("click", () => $("#trade-modal").classList.add("hidden"));
+  $("#trade-cancel-2").addEventListener("click", () => $("#trade-modal").classList.add("hidden"));
+  $("#trade-submit").addEventListener("click", async () => {
+    const m = $("#trade-modal");
+    if (m.dataset.assetClass === "forex") {
+      alert("Forex execution requires OANDA configuration (Phase C).");
+      return;
+    }
+    const body = {
+      symbol: m.dataset.symbol,
+      side: state.tradeSide,
+      quantity: parseFloat($("#trade-qty").value),
+      order_type: $("#trade-type").value,
+    };
+    if (body.order_type === "limit") body.limit_price = parseFloat($("#trade-limit").value);
+    try {
+      const r = await fetch("/api/order", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok) {
+        m.classList.add("hidden");
+        loadOrders(); loadAlerts();
+        // Auto-switch to Orders tab to show what just happened
+        $$(".bt").forEach(b => b.classList.remove("active"));
+        $$(".bottom-content").forEach(b => b.classList.remove("active"));
+        $(`.bt[data-bt="orders"]`).classList.add("active");
+        $(`.bottom-content[data-bt-content="orders"]`).classList.add("active");
+      } else {
+        alert(`Order rejected: ${data.detail || data.error || r.status}`);
+      }
+    } catch (e) { alert(`Network error: ${e.message}`); }
+  });
+
+  /* ---------- BOOT ---------- */
   refreshAll();
   startSSE();
   setInterval(loadAlerts, 5000);
-  setInterval(loadPositions, 10000);
+  setInterval(loadOrders, 7000);
   setInterval(loadWatchlist, 15000);
   setInterval(loadNews, 30000);
   setInterval(loadSignals, 5000);
