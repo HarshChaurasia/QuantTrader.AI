@@ -223,7 +223,8 @@ class AlpacaBroker(Broker):
         return self._normalize_order(raw, request)
 
     async def cancel_order(self, order_id: str) -> None:
-        await asyncio.to_thread(self._trading.cancel_order_by_id, order_id)
+        import uuid as _uuid
+        await asyncio.to_thread(self._trading.cancel_order_by_id, _uuid.UUID(order_id))
 
     async def list_open_orders(self) -> list[Order]:
         from alpaca.trading.requests import GetOrdersRequest

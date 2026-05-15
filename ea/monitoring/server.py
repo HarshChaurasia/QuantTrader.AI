@@ -71,11 +71,23 @@ _SMC_SCANNER: SMCScanner | None = None
 
 # Default SMC scan universes — user can override at runtime via /api/scanner/universe
 DEFAULT_SCAN_STOCKS = [
-    "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
-    "JPM", "V", "WMT", "UNH", "XOM", "JNJ",
+    # Indices / ETFs
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "SMH", "ARKK",
+    # Mega-cap tech
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD", "AVGO", "ORCL",
+    # Financials
+    "JPM", "BAC", "WFC", "GS", "MS", "V", "MA",
+    # Consumer / retail
+    "WMT", "COST", "HD", "MCD", "NKE", "SBUX", "DIS",
+    # Healthcare
+    "UNH", "JNJ", "LLY", "PFE", "ABBV",
+    # Energy / industrials
+    "XOM", "CVX", "BA", "CAT", "GE",
+    # High-volatility / momentum names
+    "COIN", "PLTR", "SHOP", "NFLX", "UBER", "SNOW",
 ]
-DEFAULT_SCAN_CRYPTO = ["BTC/USD", "ETH/USD", "SOL/USD"]
-DEFAULT_SCAN_FOREX = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
+DEFAULT_SCAN_CRYPTO = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD"]
+DEFAULT_SCAN_FOREX = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
 
 
 def create_app(*, autosubmit: bool = False) -> FastAPI:
@@ -122,13 +134,34 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
         _NEWS_POLLER.start()
 
         # SMC scanner with default universes
-        _SMC_SCANNER = SMCScanner(s.store, scan_interval_s=300.0)
+        _SMC_SCANNER = SMCScanner(s.store, scan_interval_s=300.0, timeframe="1Hour")
         _SMC_SCANNER.set_universes(
             stocks=DEFAULT_SCAN_STOCKS,
             crypto=DEFAULT_SCAN_CRYPTO,
             forex=DEFAULT_SCAN_FOREX,
         )
         _SMC_SCANNER.start()
+
+        # Auto-start live streams for watchlist symbols
+        from ea.brokers.alpaca.stream import AlpacaStreamRunner
+        stock_syms = [sym for sym in s.watchlist if "/" not in sym]
+        crypto_syms = [sym for sym in s.watchlist if "/" in sym]
+        if stock_syms:
+            try:
+                runner = AlpacaStreamRunner(config, stock_syms, asset_class=AssetClass.STOCK, bus=bus)
+                runner.start()
+                _STREAMS["stock"] = runner
+                s.add_alert("info", f"Stock stream started: {','.join(stock_syms)}")
+            except Exception as e:
+                s.add_alert("warning", f"Stock stream failed to start: {e}")
+        if crypto_syms:
+            try:
+                runner = AlpacaStreamRunner(config, crypto_syms, asset_class=AssetClass.CRYPTO, bus=bus)
+                runner.start()
+                _STREAMS["crypto"] = runner
+                s.add_alert("info", f"Crypto stream started: {','.join(crypto_syms)}")
+            except Exception as e:
+                s.add_alert("warning", f"Crypto stream failed to start: {e}")
 
         s.add_alert(
             "info",
@@ -291,22 +324,62 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
         return out
 
     @app.get("/api/orders")
-    async def api_orders():
+    async def api_orders(include_broker_open: bool = True):
         if _ORDER_MGR is None:
             return []
-        return [
+        rows = [
             {
+                "order_id": r.order.order_id if r.order else None,
                 "client_order_id": r.request.client_order_id,
                 "symbol": r.request.symbol,
                 "side": r.request.side.value,
                 "quantity": float(r.request.quantity),
                 "order_type": r.request.order_type.value,
+                "limit_price": float(r.request.limit_price) if r.request.limit_price else None,
                 "status": r.order.status.value if r.order else "failed",
+                "filled_qty": float(r.order.filled_quantity) if r.order else 0,
+                "avg_fill_price": float(r.order.avg_fill_price) if r.order and r.order.avg_fill_price else None,
                 "submitted_at": r.submitted_at.isoformat(),
                 "error": r.error,
+                "source": "local",
             }
             for r in _ORDER_MGR.recent[:50]
         ]
+        # Also include any open orders sitting at the broker that we didn't submit ourselves
+        if include_broker_open:
+            try:
+                broker_open = await state_mod.get_state().broker.list_open_orders()
+                seen_ids = {r["client_order_id"] for r in rows}
+                for o in broker_open:
+                    if o.client_order_id and o.client_order_id in seen_ids:
+                        continue
+                    rows.append({
+                        "order_id": o.order_id,
+                        "client_order_id": o.client_order_id,
+                        "symbol": o.symbol,
+                        "side": o.side.value,
+                        "quantity": float(o.quantity),
+                        "order_type": o.order_type.value,
+                        "limit_price": None,
+                        "status": o.status.value,
+                        "filled_qty": float(o.filled_quantity),
+                        "avg_fill_price": float(o.avg_fill_price) if o.avg_fill_price else None,
+                        "submitted_at": o.submitted_at.isoformat(),
+                        "error": None,
+                        "source": "broker",
+                    })
+            except Exception as e:
+                logger.debug("list_open_orders failed: {}", e)
+        return rows
+
+    @app.delete("/api/orders/{order_id}")
+    async def api_cancel_order(order_id: str):
+        try:
+            await state_mod.get_state().broker.cancel_order(order_id)
+            state_mod.get_state().add_alert("info", f"order canceled: {order_id}")
+            return {"canceled": order_id}
+        except Exception as e:
+            raise HTTPException(400, f"cancel failed: {e}")
 
     @app.get("/api/risk")
     async def api_risk():
@@ -393,6 +466,17 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
         if _SMC_SCANNER is None:
             raise HTTPException(503, "scanner not running")
         _SMC_SCANNER.set_universes(stocks=stocks, crypto=crypto, forex=forex)
+        return _SMC_SCANNER.status()
+
+    @app.post("/api/scanner/mode")
+    async def api_scanner_mode(mode: str):
+        if _SMC_SCANNER is None:
+            raise HTTPException(503, "scanner not running")
+        try:
+            _SMC_SCANNER.set_mode(mode)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        state_mod.get_state().add_alert("info", f"Scanner mode -> {mode}")
         return _SMC_SCANNER.status()
 
     @app.get("/api/news")
