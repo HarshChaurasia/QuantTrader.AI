@@ -184,3 +184,31 @@ async def test_signal_consumer_no_submit_when_disabled(tmp_path):
     assert outcome.decision.ok
     assert outcome.order_record is None
     assert not broker.submit_order.called
+
+
+def test_atr_pct_falls_back_through_timeframes(tmp_path):
+    """No daily bars but 1Hour present → ATR from 1Hour, not the flat 2%."""
+    import pandas as pd
+    from ea.brokers.models import AssetClass
+    from ea.config import load_config
+    from ea.data.store import BarStore
+    from ea.risk.manager import RiskManager
+
+    store = BarStore(tmp_path / "atr.duckdb")
+    n = 60
+    idx = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+    base = [100 + i * 0.1 for i in range(n)]
+    df = pd.DataFrame({
+        "open": base, "high": [b * 1.02 for b in base],
+        "low": [b * 0.98 for b in base], "close": base,
+        "volume": [1000] * n,
+    }, index=idx)
+    store.upsert_bars(df, "EURUSD", "1Hour", AssetClass.FOREX)
+
+    risk = RiskManager(load_config(profile="paper"))
+    val = risk._atr_pct(store, "EURUSD", AssetClass.FOREX)
+    assert val != risk._ATR_DEFAULT_PCT
+    assert 0 < val < 0.2
+
+    # truly empty store for an unknown symbol → crude default
+    assert risk._atr_pct(store, "ZZZZ", AssetClass.STOCK) == risk._ATR_DEFAULT_PCT

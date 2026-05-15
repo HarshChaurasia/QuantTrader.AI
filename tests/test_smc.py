@@ -138,3 +138,35 @@ def test_scanner_status_shape(tmp_path):
     st = scanner.status()
     assert "running" in st and "scans_completed" in st
     assert st["scans_completed"] == 0
+
+
+# --- SMC scalp variant ---
+
+def test_scalp_strategy_config_and_reuse():
+    """SMCScalpStrategy reuses the strict base on_bar but rewires timeframe,
+    cooldown and asset classes — confluence rules are untouched."""
+    from ea.brokers.models import AssetClass, BarEvent
+    from decimal import Decimal
+    from ea.strategies.base import Context
+    from ea.strategies.smc.strategy import SMCStrategy
+    from ea.strategies.smc.scalp import SMCScalpStrategy
+
+    s = SMCScalpStrategy()
+    assert s.name == "smc_scalp"
+    assert s.timeframe == "1Min"
+    assert s.asset_classes == {AssetClass.CRYPTO, AssetClass.FOREX}
+    assert s.cooldown_s == 300.0
+    # base default cooldown unchanged (no behavioural regression for swing SMC)
+    assert SMCStrategy().cooldown_s == 86_400.0
+    # reuses the same evaluate_setup code path as the swing strategy
+    assert SMCScalpStrategy.on_bar is SMCStrategy.on_bar
+
+    # a non-1Min bar is ignored (timeframe filter), no exceptions
+    ctx = Context(bar_store=None, state=None)
+    bar = BarEvent(
+        symbol="BTC/USD", asset_class=AssetClass.CRYPTO,
+        timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        open=Decimal("1"), high=Decimal("1"), low=Decimal("1"),
+        close=Decimal("1"), volume=Decimal("1"), timeframe="1Hour",
+    )
+    assert s.on_bar(bar, ctx) == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from ea.logging import logger
 from ea.news.models import NewsItem, NewsSource
 
 
@@ -17,8 +18,14 @@ def _fetch_sync(symbol: str) -> list[tuple[NewsItem, str]]:
     except Exception:
         return []
 
+    if not isinstance(raw, list):
+        logger.warning("yahoo news: unexpected payload type {} for {}", type(raw).__name__, symbol)
+        return []
+
     out: list[tuple[NewsItem, str]] = []
     for r in raw:
+        if not isinstance(r, dict):
+            continue
         # yfinance schema varies between versions — defend on both shapes
         content = r.get("content") if isinstance(r, dict) else None
         title = (content or r).get("title") if isinstance((content or r), dict) else None
@@ -42,7 +49,7 @@ def _fetch_sync(symbol: str) -> list[tuple[NewsItem, str]]:
                 published = datetime.fromisoformat(pub_iso.replace("Z", "+00:00"))
             except Exception:
                 published = datetime.now(timezone.utc)
-        elif "providerPublishTime" in r:
+        elif isinstance(r.get("providerPublishTime"), (int, float)):
             published = datetime.fromtimestamp(r["providerPublishTime"], tz=timezone.utc)
         else:
             published = datetime.now(timezone.utc)
@@ -60,6 +67,14 @@ def _fetch_sync(symbol: str) -> list[tuple[NewsItem, str]]:
             ),
             symbol,
         ))
+
+    # Schema-drift sanity check: yfinance returned items but we parsed none.
+    # Surfaces in logs during a paper run instead of silently dropping news.
+    if raw and not out:
+        logger.warning(
+            "yahoo news: {} raw items for {} but 0 parsed — schema may have drifted",
+            len(raw), symbol,
+        )
     return out
 
 

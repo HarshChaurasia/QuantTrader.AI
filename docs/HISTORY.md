@@ -5,6 +5,62 @@ authoritative "what actually happened" record — TASKS.md checkboxes are stale.
 
 ---
 
+## 2026-05-15 — Intraday backtest + EOD reports/alerts + D/E cleanup
+
+Follow-up to the scalper: "fix it and complete remaining activities"
+(confirmed scope). Closed the scalper's backtest caveat and the rest of the
+buildable backlog (B remainder, D, E).
+
+- **Intraday backtest.** `BacktestEngine.run` + `run_walk_forward` now take a
+  `timeframe` (1Min/5Min/15Min/1Hour/1Day); Sharpe annualised per timeframe
+  (`_ANN_FACTOR`). CLI `ea backtest` gained `--timeframe` and `--asset-class`
+  and a `smc_scalp` strategy entry; SMC strategies are built for the chosen
+  timeframe so they actually fire. `smc_scalp` is now backtestable.
+- **EOD reports.** `ea/monitoring/reports.py` — `render_eod_markdown` +
+  async `build/write_eod_report`; `ea report` CLI and `POST /api/report/eod`;
+  writes `reports/eod_<date>.md` (account, positions, today's orders,
+  signals-by-strategy, risk, alerts).
+- **Alerts.** `ea/monitoring/alerts.py` — pure `evaluate_alerts` (breaker /
+  stream-disconnect / stale-or-errored order) + `AlertMonitor` 60s loop with
+  key-dedup; started/stopped in the server lifespan.
+- **D fixes.** Risk `_atr_pct` walks 1Day→1Hour→1Min and honours
+  `signal.asset_class` (forex no longer misread as stock); shared NaN-safe
+  `_atr_pct_from_df`. Yahoo news parser hardened + schema-drift warning.
+- **E.** TASKS.md replaced with a deprecation pointer (REMAINING.md +
+  HISTORY.md are the living docs).
+- Tests: intraday backtest, reports render, alerts (all-three + quiet),
+  ATR fallback. Full suite **97 passed**.
+
+---
+
+## 2026-05-15 — SMC 1Min scalper (parallel strategy + dashboard tab)
+
+User asked for an SMC scalping strategy running in parallel, with its own
+dashboard tab but trades still visible in the unified history. Confirmed three
+decisions first (memory: confirm-before-task, keep-SMC-strict, swing-avoids-PDT):
+**crypto+forex** (no PDT), **1Min**, **strict confluence reused unchanged**.
+
+- `ea/strategies/smc/strategy.py`: added `cooldown_s` param to `SMCStrategy`
+  (default 86_400 — swing behaviour unchanged); on_bar cooldown now uses it.
+- `ea/strategies/smc/scalp.py`: `SMCScalpStrategy(SMCStrategy)` — name
+  `smc_scalp`, 1Min, crypto+forex, RR 1.5, horizon 1d, 300s cooldown. Reuses
+  `evaluate_setup` verbatim (strict confluence, not loosened).
+- `server.py`: registered in `StrategyRunner` (runs parallel with
+  news/xsection/swing-SMC). Scalp crypto symbols unioned into the crypto
+  stream (it already emits 1Min bars); cold-start Alpaca 1Min backfill for
+  scalp crypto; 60s yfinance 1Min poller for scalp forex (signal-only — forex
+  still has no live exec path). New `/api/scalp` endpoint (filtered focus
+  view; full ledger stays in Signals/Orders/Positions).
+- Dashboard: new "Scalping" nav tab + view (open scalp positions, recent
+  scalp signals, scalper on/off toggle); 8s refresh. CSS `.section-label`.
+- Tests: scalp strategy config/reuse + `/api/scalp` + nav-tab render.
+  Full suite **92 passed**.
+
+Limitation: backtest engine is daily-bar only by design, so `smc_scalp`
+cannot be backtested there — deliberately not added to the CLI strat_map.
+
+---
+
 ## 2026-05-15 — Backtest engine completion (A.9)
 
 The core event-driven engine (`ea/backtest/engine.py`) + CLI command + 3

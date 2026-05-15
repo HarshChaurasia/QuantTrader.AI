@@ -146,3 +146,22 @@ def test_order_endpoint_blocked_until_phase_a8(app_client):
         "symbol": "SPY", "side": "buy", "quantity": 1, "order_type": "market"
     })
     assert r.status_code == 503  # explicit refusal until A.8
+
+
+def test_scalp_endpoint(app_client):
+    """Scalp tab payload is well-formed even before lifespan/subsystems start."""
+    r = app_client.get("/api/scalp")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["timeframe"] == "1Min"
+    assert data["enabled"] is False  # runner not started in TestClient
+    assert data["signals"] == []
+    assert data["positions"] == []
+    assert set(data["universe"]) == {"crypto", "forex"}
+    assert "BTC/USD" in data["universe"]["crypto"]
+
+
+def test_scalp_nav_tab_rendered(app_client):
+    r = app_client.get("/")
+    assert 'data-view="scalp"' in r.text
+    assert 'data-view-content="scalp"' in r.text

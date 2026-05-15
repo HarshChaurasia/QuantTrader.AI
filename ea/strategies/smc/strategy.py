@@ -151,10 +151,17 @@ class SMCStrategy(Strategy):
     name = "smc"
     asset_classes = {AssetClass.STOCK, AssetClass.CRYPTO, AssetClass.FOREX}
 
-    def __init__(self, risk_reward: float = 2.0, horizon_days: int = 7, timeframe: str = "1Hour"):
+    def __init__(
+        self,
+        risk_reward: float = 2.0,
+        horizon_days: int = 7,
+        timeframe: str = "1Hour",
+        cooldown_s: float = 86_400.0,
+    ):
         self.risk_reward = risk_reward
         self.horizon_days = horizon_days
         self.timeframe = timeframe
+        self.cooldown_s = cooldown_s
         self._last_signal_ts: dict[str, datetime] = {}
 
     def on_bar(self, event: BarEvent, ctx: Context) -> list[Signal]:
@@ -170,10 +177,10 @@ class SMCStrategy(Strategy):
         if setup is None or setup["status"] != "in_zone":
             return []
 
-        # Cooldown: don't re-emit on the same symbol within 24h
+        # Cooldown: don't re-emit on the same symbol within cooldown_s
         last = self._last_signal_ts.get(event.symbol)
         cur_ts = event.timestamp
-        if last is not None and (cur_ts - last).total_seconds() < 86_400:
+        if last is not None and (cur_ts - last).total_seconds() < self.cooldown_s:
             return []
         self._last_signal_ts[event.symbol] = cur_ts
 

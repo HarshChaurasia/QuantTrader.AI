@@ -71,6 +71,7 @@ def run_walk_forward(
     commission_bps: float = 0.0,
     slippage_bps: float = 5.0,
     asset_class: AssetClass = AssetClass.STOCK,
+    timeframe: str = "1Day",
 ) -> WalkForwardResult:
     """Run consecutive backtests, compounding equity across windows.
 
@@ -98,7 +99,7 @@ def run_walk_forward(
             slippage_bps=slippage_bps,
         )
         try:
-            result = engine.run(symbols, w_start, w_end, asset_class)
+            result = engine.run(symbols, w_start, w_end, asset_class, timeframe)
         except ValueError as e:
             logger.warning("walk-forward: skipping window {} -> {}: {}", w_start.date(), w_end.date(), e)
             w_start = w_start + timedelta(days=step)
@@ -123,7 +124,8 @@ def run_walk_forward(
     combined = combined[~combined.index.duplicated(keep="first")].sort_index()
 
     rets = combined.pct_change().dropna()
-    sharpe = float((rets.mean() / rets.std()) * (252 ** 0.5)) if len(rets) > 1 and rets.std() > 0 else 0.0
+    ann = BacktestEngine._ANN_FACTOR.get(timeframe, 252)
+    sharpe = float((rets.mean() / rets.std()) * (ann ** 0.5)) if len(rets) > 1 and rets.std() > 0 else 0.0
     rolling_max = combined.cummax()
     dd = (combined - rolling_max) / rolling_max
     max_dd_pct = abs(float(dd.min() * 100)) if len(dd) else 0.0

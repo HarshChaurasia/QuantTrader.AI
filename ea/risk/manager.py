@@ -83,23 +83,44 @@ class RiskManager:
         self._state.weekly_loss_pct = 0.0
         self._state.weekly_halted = False
 
-    def _atr_pct(self, bar_store: Any, symbol: str) -> float:
-        """20-day ATR as % of last close. Fallback to a fixed 2% if data missing."""
-        try:
-            df = bar_store.get_bars(symbol, "1Day", AssetClass.STOCK if "/" not in symbol else AssetClass.CRYPTO)
-            if df.empty or len(df) < 15:
-                return 0.02
-            hi = df["high"]
-            lo = df["low"]
-            cl = df["close"]
-            tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
-            atr = tr.rolling(14).mean().iloc[-1]
-            last_close = float(cl.iloc[-1])
-            if last_close <= 0:
-                return 0.02
-            return float(atr) / last_close
-        except Exception:
-            return 0.02
+    _ATR_DEFAULT_PCT = 0.02  # last-resort when no bars at any timeframe
+
+    @staticmethod
+    def _atr_pct_from_df(df) -> float | None:
+        """ATR(14) as a fraction of last close, or None if df too thin."""
+        if df is None or df.empty or len(df) < 15:
+            return None
+        hi, lo, cl = df["high"], df["low"], df["close"]
+        tr = pd.concat(
+            [hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1
+        ).max(axis=1)
+        atr = tr.rolling(14).mean().iloc[-1]
+        last_close = float(cl.iloc[-1])
+        if last_close <= 0 or atr != atr:  # NaN guard
+            return None
+        return float(atr) / last_close
+
+    def _atr_pct(self, bar_store: Any, symbol: str,
+                 asset_class: AssetClass | None = None) -> float:
+        """ATR% for vol sizing.
+
+        Daily bars are best; if a symbol is news-driven but never streamed it
+        may have no daily history, so fall back to 1Hour then 1Min bars
+        (ATR-as-%-of-close is timeframe-tolerant for sizing) before the crude
+        flat default. Asset class is honoured so forex symbols resolve to
+        forex bars instead of being misread as stocks.
+        """
+        if asset_class is None:
+            asset_class = AssetClass.CRYPTO if "/" in symbol else AssetClass.STOCK
+        for tf in ("1Day", "1Hour", "1Min"):
+            try:
+                df = bar_store.get_bars(symbol, tf, asset_class)
+            except Exception:
+                continue
+            val = self._atr_pct_from_df(df)
+            if val is not None and val > 0:
+                return val
+        return self._ATR_DEFAULT_PCT
 
     def evaluate(
         self,
@@ -148,7 +169,7 @@ class RiskManager:
                 return self._reject(signal, "already positioned in this direction")
 
         # 4) Position sizing — vol-targeted risk parity
-        atr_pct = self._atr_pct(bar_store, signal.symbol)
+        atr_pct = self._atr_pct(bar_store, signal.symbol, signal.asset_class)
         if atr_pct <= 0:
             return self._reject(signal, "invalid ATR")
         last_price = self._last_price(bar_store, signal.symbol)
