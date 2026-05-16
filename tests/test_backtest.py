@@ -78,6 +78,26 @@ def test_walk_forward_compounds_and_reports(tmp_path):
     assert md.with_suffix(".json").exists()
 
 
+def test_backtest_intraday_timeframe(tmp_path):
+    """Engine replays a non-daily timeframe and tags bars with it."""
+    cfg = load_config(profile="paper")
+    store = BarStore(tmp_path / "tf.duckdb")
+    store.upsert_bars(_make_trending_bars(100, +0.5, 250), "WINNER", "1Hour", AssetClass.STOCK)
+    store.upsert_bars(_make_trending_bars(100, -0.1, 250), "LOSER", "1Hour", AssetClass.STOCK)
+
+    engine = BacktestEngine(cfg, store, [CrossSectionalMomentumStrategy(top_n=1)],
+                            starting_equity=10_000.0, slippage_bps=0)
+    result = engine.run(
+        ["WINNER", "LOSER"],
+        start=datetime(2023, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2023, 9, 8, tzinfo=timezone.utc),
+        asset_class=AssetClass.STOCK,
+        timeframe="1Hour",
+    )
+    assert len(result.equity_curve) > 100
+    assert engine._ANN_FACTOR["1Hour"] == 252 * 7
+
+
 def test_backtest_raises_on_empty_data(tmp_path):
     cfg = load_config(profile="paper")
     store = BarStore(tmp_path / "bt.duckdb")

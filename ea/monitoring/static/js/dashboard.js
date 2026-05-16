@@ -539,10 +539,68 @@
     renderScannerStats(st);
   }
 
+  function renderScalp(data) {
+    if (!data) return;
+    const sigs = data.signals || [];
+    const pos = data.positions || [];
+    $("#scalp-sigcount").textContent = data.signal_count ?? sigs.length;
+    $("#scalp-poscount").textContent = pos.length;
+    $("#scalp-tf").textContent = data.timeframe || "1Min";
+    const tog = $("#scalp-toggle");
+    if (tog) tog.checked = !!data.enabled;
+
+    const pbody = $("#scalp-pos-body");
+    if (!pos.length) {
+      pbody.innerHTML = `<tr class="placeholder"><td colspan="6">No open scalp positions</td></tr>`;
+    } else {
+      pbody.innerHTML = pos.map(p => {
+        const pl = Number(p.unrealized_pl ?? p.pl ?? 0);
+        const plPct = Number(p.unrealized_pl_pct ?? p.pl_pct ?? 0);
+        const cls = pl >= 0 ? "long" : "short";
+        return `<tr>
+          <td><strong>${escapeHtml(p.symbol || '')}</strong></td>
+          <td class="num">${p.quantity ?? p.qty ?? ''}</td>
+          <td class="num">${p.avg_entry_price ?? p.entry ?? ''}</td>
+          <td class="num">${p.current_price ?? p.last ?? ''}</td>
+          <td class="num ${cls}">${pl.toFixed(2)}</td>
+          <td class="num ${cls}">${(plPct * (Math.abs(plPct) < 1 ? 100 : 1)).toFixed(2)}%</td>
+        </tr>`;
+      }).join("");
+    }
+
+    const list = $("#scalp-sig-list");
+    if (!sigs.length) {
+      list.innerHTML = `<li class="placeholder">No scalp signals yet</li>`;
+    } else {
+      list.innerHTML = sigs.map(s => {
+        const cls = s.submitted ? "submitted" : (s.accepted ? "accepted" : "rejected");
+        const sideCls = s.side === "long" ? "long" : (s.side === "short" ? "short" : "");
+        const conv = (s.conviction || 0).toFixed(2);
+        const status = s.submitted ? `Sent · ${s.order_status || ''}` : (s.accepted ? "Accepted" : `Rejected · ${s.reason || ''}`);
+        return `<li class="${cls}">
+          <span class="sig-side ${sideCls}">${(s.side || '').toUpperCase()}</span>
+          <span><strong>${escapeHtml(s.symbol || '')}</strong></span>
+          <span class="sig-meta">c=${conv} · ${escapeHtml(s.rationale || '')}</span>
+          <span class="sig-meta">${escapeHtml(status)}</span>
+        </li>`;
+      }).join("");
+    }
+  }
+
+  async function loadScalp() { renderScalp(await api.get("/api/scalp")); }
+
+  const scalpTog = $("#scalp-toggle");
+  if (scalpTog) {
+    scalpTog.addEventListener("change", async () => {
+      await fetch(`/api/strategies/smc_scalp/${scalpTog.checked ? 'resume' : 'pause'}`, { method: "POST" });
+      loadScalp(); loadStrategies();
+    });
+  }
+
   async function refreshAll() {
     await Promise.allSettled([
       loadAccount(), loadOrders(), loadAlerts(), loadWatchlist(), loadNews(),
-      loadSignals(), loadStrategies(), loadRisk(), loadScanner(),
+      loadSignals(), loadStrategies(), loadRisk(), loadScanner(), loadScalp(),
     ]);
   }
 
@@ -694,4 +752,5 @@
   setInterval(loadRisk, 10000);
   setInterval(loadStrategies, 15000);
   setInterval(loadScanner, 20000);
+  setInterval(loadScalp, 8000);
 })();

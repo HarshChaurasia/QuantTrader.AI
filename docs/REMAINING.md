@@ -35,9 +35,11 @@ That's it to be "paper trading". Everything below is to trust the results.
 - [ ] **30-trading-day paper run (T A.12).** Calendar gate, not code. Daily
       EOD review; compare P&L distribution to backtest expectation. Gate
       decision: proceed to Phase B / iterate / kill.
-- [ ] **EOD report + alerts (T A.11 remainder).** `ea/monitoring/reports.py`
-      (daily markdown to disk) and `ea/monitoring/alerts.py` (breaker /
-      disconnect / unfilled-order). Needed to actually review a 30-day run.
+- [x] ~~**EOD report + alerts (T A.11 remainder).**~~ Built.
+      `ea/monitoring/reports.py` (daily markdown → `reports/eod_<date>.md`,
+      `ea report` CLI + `POST /api/report/eod`) and `ea/monitoring/alerts.py`
+      (`AlertMonitor`: breaker / stream-disconnect / stale-order, deduped,
+      60s loop, wired into the server lifespan).
 
 ## C. Strategy backlog (framework ready, implementations missing)
 
@@ -53,10 +55,12 @@ That's it to be "paper trading". Everything below is to trust the results.
 
 ## D. Known smaller gaps (from STATUS.md, re-verified)
 
-- [ ] **Risk `_atr_pct` fallback** — falls back to flat 2% when bars missing;
-      too crude for unstreamed-symbol intraday news. Add a live-price path.
-- [ ] **Yahoo news schema** — yfinance news format drifts across versions;
-      defensive parser needs a real-data sanity check during paper run.
+- [x] ~~**Risk `_atr_pct` fallback**~~ — now walks 1Day→1Hour→1Min before
+      the flat 2% default, and honours `signal.asset_class` (forex no longer
+      misread as stock).
+- [x] ~~**Yahoo news schema**~~ — parser hardened (non-list/non-dict guards,
+      numeric `providerPublishTime` check) and now logs a warning when raw
+      items arrive but none parse, so schema drift is visible during a run.
 - [x] ~~Live bars not persisted to DuckDB~~ — fixed; `state.consume_bus`
       upserts stream bars.
 - [x] ~~Daily equity anchor resets on restart~~ — fixed via
@@ -64,8 +68,9 @@ That's it to be "paper trading". Everything below is to trust the results.
 
 ## E. Housekeeping
 
-- [ ] **TASKS.md checkboxes are stale** (all `[ ]` despite Phase A done).
-      Either update them or delete TASKS.md in favor of this file + HISTORY.md.
+- [x] ~~**TASKS.md checkboxes are stale**~~ — TASKS.md retired and replaced
+      with a deprecation pointer to REMAINING.md + HISTORY.md (old task tree
+      preserved in git history).
 - [ ] MCP server for chat-with-system — explicitly post-Phase-A; low priority.
 
 ---

@@ -43,16 +43,18 @@ The hard one. Once this works, B and C are mostly adapter swaps.
 - Order manager (idempotent, reconciling).
 - Position tracker.
 
-**A.5 — Backtest**
-- Event-driven engine with cost model.
-- Walk-forward harness.
-- Performance metrics + per-strategy attribution.
-- Run S1, S2, S3 backtests over 3+ years; generate report.
+**A.5 — Backtest** — ✅ *delivered (see docs/HISTORY.md)*
+- Event-driven engine with cost model. ✅
+- Walk-forward harness. ✅
+- Performance metrics + per-strategy attribution. ✅
+- Any-timeframe replay + report-to-disk. ✅
+- *Remaining:* run multi-year S2/SMC/scalp backtests and compare to paper
+  (data exercise, not code); news-driven replay still deferred.
 
-**A.6 — Paper trading**
-- Wire paper Alpaca to live system.
-- Monitoring dashboard.
-- Daily EOD reports.
+**A.6 — Paper trading** — ✅ *delivered*
+- Wire paper Alpaca to live system. ✅
+- Monitoring dashboard (incl. Scalping view). ✅
+- Daily EOD reports + operational alert monitor. ✅
 
 **Gate:** 30 trading days of paper trading with:
 - Sharpe > 0.5 net of estimated costs

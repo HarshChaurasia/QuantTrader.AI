@@ -131,6 +131,16 @@ class BacktestEngine:
         self._starting_equity = starting_equity
         self._commission_bps = commission_bps
         self._slippage_bps = slippage_bps
+        self._timeframe = "1Day"
+
+    # Annualization factor for Sharpe, by bar timeframe (~ bars per year).
+    _ANN_FACTOR = {
+        "1Min": 252 * 390,   # US session minutes; crypto/fx slightly off but fine
+        "5Min": 252 * 78,
+        "15Min": 252 * 26,
+        "1Hour": 252 * 7,
+        "1Day": 252,
+    }
 
     def run(
         self,
@@ -138,12 +148,14 @@ class BacktestEngine:
         start: datetime,
         end: datetime,
         asset_class: AssetClass = AssetClass.STOCK,
+        timeframe: str = "1Day",
     ) -> BacktestResult:
+        self._timeframe = timeframe
         # Load all bars for all symbols once, indexed by date for fast lookup
         per_symbol: dict[str, pd.DataFrame] = {}
         all_dates: set[datetime] = set()
         for sym in symbols:
-            df = self._store.get_bars(sym, "1Day", asset_class, start=start, end=end)
+            df = self._store.get_bars(sym, timeframe, asset_class, start=start, end=end)
             if df.empty:
                 logger.warning("backtest: no bars for {}", sym)
                 continue
@@ -187,7 +199,7 @@ class BacktestEngine:
                     timestamp=ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
                     open=Decimal(str(row["open"])), high=Decimal(str(row["high"])),
                     low=Decimal(str(row["low"])), close=Decimal(str(row["close"])),
-                    volume=Decimal(str(row["volume"])), timeframe="1Day",
+                    volume=Decimal(str(row["volume"])), timeframe=self._timeframe,
                 ))
 
             # Fill pending orders at this bar's open
@@ -302,8 +314,9 @@ class BacktestEngine:
 
         # Sharpe (daily returns, no risk-free rate, annualized 252)
         rets = curve.pct_change().dropna()
+        ann = self._ANN_FACTOR.get(self._timeframe, 252)
         if len(rets) > 1 and rets.std() > 0:
-            sharpe = float((rets.mean() / rets.std()) * (252 ** 0.5))
+            sharpe = float((rets.mean() / rets.std()) * (ann ** 0.5))
         else:
             sharpe = 0.0
 

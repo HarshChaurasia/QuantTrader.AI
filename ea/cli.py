@@ -417,6 +417,8 @@ def backtest(
         "xsection_momentum",
         help="Comma-separated. Available: xsection_momentum, news_momentum, smc",
     ),
+    timeframe: str = typer.Option("1Day", help="Bar timeframe: 1Min, 5Min, 15Min, 1Hour, 1Day"),
+    asset_class: str = typer.Option("stock", help="stock | crypto | forex"),
     walk_forward: bool = typer.Option(False, help="Segmented out-of-sample windows, compounded"),
     window_days: int = typer.Option(90, help="Walk-forward window length (days)"),
     report: bool = typer.Option(False, help="Also write markdown+JSON report to ./reports"),
@@ -432,18 +434,20 @@ def backtest(
     from ea.data.store import BarStore
     from ea.strategies.news_momentum import NewsMomentumStrategy
     from ea.strategies.smc.strategy import SMCStrategy
+    from ea.strategies.smc.scalp import SMCScalpStrategy
     from ea.strategies.xsection_momentum import CrossSectionalMomentumStrategy
 
     sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     start_dt = DT.fromisoformat(start).replace(tzinfo=timezone.utc)
     end_dt = (DT.fromisoformat(end).replace(tzinfo=timezone.utc) if end else datetime.now(timezone.utc))
 
-    # SMC filters on bar timeframe; backtest replays 1Day bars, so it must be
-    # constructed for "1Day" or it never fires.
+    # SMC strategies filter on bar timeframe, so they must be constructed for
+    # the same timeframe the engine replays or they never fire.
     strat_map = {
         "xsection_momentum": CrossSectionalMomentumStrategy,
         "news_momentum": NewsMomentumStrategy,
-        "smc": lambda: SMCStrategy(timeframe="1Day"),
+        "smc": lambda: SMCStrategy(timeframe=timeframe),
+        "smc_scalp": lambda: SMCScalpStrategy(timeframe=timeframe),
     }
     names = []
     for s in strategies.split(","):
@@ -456,19 +460,25 @@ def backtest(
     def make_strategies():
         return [strat_map[n]() for n in names]
 
+    ac_map = {"stock": AssetClass.STOCK, "crypto": AssetClass.CRYPTO, "forex": AssetClass.FOREX}
+    ac = ac_map.get(asset_class.strip().lower())
+    if ac is None:
+        console.print(f"[red]unknown asset class: {asset_class}[/red]")
+        raise typer.Exit(1)
+
     store = BarStore()
     if walk_forward:
         result = run_walk_forward(
             cfg, store, make_strategies, sym_list, start_dt, end_dt,
             window_days=window_days, starting_equity=starting_equity,
-            asset_class=AssetClass.STOCK,
+            asset_class=ac, timeframe=timeframe,
         )
         console.print(f"\n[bold cyan]Walk-forward result[/bold cyan]")
         for line in result.summary_lines():
             console.print(line)
     else:
         engine = BacktestEngine(cfg, store, make_strategies(), starting_equity=starting_equity)
-        result = engine.run(sym_list, start_dt, end_dt, AssetClass.STOCK)
+        result = engine.run(sym_list, start_dt, end_dt, ac, timeframe)
         console.print(f"\n[bold cyan]Backtest result[/bold cyan]")
         for line in result.summary_lines():
             console.print(line)
@@ -481,6 +491,29 @@ def backtest(
     if report:
         path = write_report(result, label="walkforward" if walk_forward else "backtest")
         console.print(f"\n[dim]report: {path}[/dim]")
+
+
+@app.command()
+def report() -> None:
+    """Write today's EOD report (account/positions/risk) to ./reports."""
+    setup_logging()
+    _require_alpaca_creds()
+    import asyncio as _aio
+    from ea.brokers.alpaca.client import AlpacaBroker
+    from ea.data.store import BarStore
+    from ea.monitoring import state as state_mod
+    from ea.monitoring.reports import write_eod_report
+
+    cfg = get_config()
+    state_mod._state = state_mod.DashboardState(
+        config=cfg, broker=AlpacaBroker(cfg), store=BarStore(),
+    )
+
+    async def _go():
+        return await write_eod_report(order_mgr=None, signal_consumer=None, risk=None)
+
+    path = _aio.run(_go())
+    console.print(f"[green]EOD report written:[/green] {path}")
 
 
 @app.command()

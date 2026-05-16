@@ -36,6 +36,7 @@ from ea.scanner.smc_scanner import SMCScanner
 from ea.strategies.news_momentum import NewsMomentumStrategy
 from ea.strategies.runner import StrategyRunner
 from ea.strategies.smc.strategy import SMCStrategy
+from ea.strategies.smc.scalp import SMCScalpStrategy
 from ea.strategies.xsection_momentum import CrossSectionalMomentumStrategy
 
 BASE_DIR = Path(__file__).parent
@@ -89,6 +90,14 @@ DEFAULT_SCAN_STOCKS = [
 DEFAULT_SCAN_CRYPTO = ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "LINK/USD"]
 DEFAULT_SCAN_FOREX = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
 
+# 1-minute scalping universe (crypto + forex only — no PDT, see SMCScalpStrategy).
+# Kept small: 1Min data + intraday signal rate is heavy.
+DEFAULT_SCALP_CRYPTO = ["BTC/USD", "ETH/USD", "SOL/USD"]
+DEFAULT_SCALP_FOREX = ["EURUSD", "GBPUSD", "USDJPY"]
+
+_SCALP_FOREX_TASK: asyncio.Task | None = None
+_ALERT_MONITOR: Any | None = None
+
 
 def create_app(*, autosubmit: bool = False) -> FastAPI:
     setup_logging()
@@ -98,6 +107,7 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         global _NEWS_POLLER, _STRATEGY_RUNNER, _SIGNAL_CONSUMER, _RISK, _ORDER_MGR, _SMC_SCANNER
+        global _ALERT_MONITOR
         bus = get_bus()
         bus.bind_loop()
 
@@ -109,7 +119,12 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
         # Strategy runner — register active strategies here
         ctx = Context(bar_store=s.store, state=s)
         _STRATEGY_RUNNER = StrategyRunner(
-            [NewsMomentumStrategy(), CrossSectionalMomentumStrategy(), SMCStrategy()],
+            [
+                NewsMomentumStrategy(),
+                CrossSectionalMomentumStrategy(),
+                SMCStrategy(),
+                SMCScalpStrategy(),  # parallel 1Min crypto+forex scalper
+            ],
             ctx=ctx, bus=bus,
         )
         _STRATEGY_RUNNER.start()
@@ -145,7 +160,9 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
         # Auto-start live streams for watchlist symbols
         from ea.brokers.alpaca.stream import AlpacaStreamRunner
         stock_syms = [sym for sym in s.watchlist if "/" not in sym]
-        crypto_syms = [sym for sym in s.watchlist if "/" in sym]
+        # Union scalp crypto symbols into the crypto stream so the 1Min
+        # scalper gets live bars even if they aren't on the watchlist.
+        crypto_syms = sorted({sym for sym in s.watchlist if "/" in sym} | set(DEFAULT_SCALP_CRYPTO))
         if stock_syms:
             try:
                 runner = AlpacaStreamRunner(config, stock_syms, asset_class=AssetClass.STOCK, bus=bus)
@@ -163,6 +180,72 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
             except Exception as e:
                 s.add_alert("warning", f"Crypto stream failed to start: {e}")
 
+        # --- 1Min scalping data feeds ---
+        global _SCALP_FOREX_TASK
+        from ea.data.backfill import backfill_symbols, _fetch_from_yfinance
+        from datetime import timedelta
+        from decimal import Decimal
+
+        # Cold-start 1Min history for scalp crypto (Alpaca supports crypto 1Min)
+        # so evaluate_setup has its >=30-bar window immediately, not after an
+        # hour of live ticks. Best-effort; live stream tops it up via consume_bus.
+        async def _scalp_crypto_backfill() -> None:
+            try:
+                start = datetime.now(timezone.utc) - timedelta(days=2)
+                await backfill_symbols(
+                    config, s.store, DEFAULT_SCALP_CRYPTO,
+                    start=start, timeframe="1Min",
+                    asset_class=AssetClass.CRYPTO, concurrency=2,
+                )
+                s.add_alert("info", f"Scalp 1Min backfill: {','.join(DEFAULT_SCALP_CRYPTO)}")
+            except Exception as e:
+                s.add_alert("warning", f"Scalp crypto backfill failed: {e}")
+
+        # Forex has no Alpaca stream and the backfill helper blocks 1Min
+        # yfinance — so poll yfinance 1Min directly every 60s, upsert, and
+        # republish the latest bar onto the bus for the scalper. Signal-only:
+        # forex still has no live execution path (Phase C / OANDA).
+        async def _scalp_forex_poller() -> None:
+            while True:
+                for sym in DEFAULT_SCALP_FOREX:
+                    try:
+                        start = datetime.now(timezone.utc) - timedelta(days=2)
+                        end = datetime.now(timezone.utc)
+                        df = await asyncio.to_thread(
+                            _fetch_from_yfinance, sym, start, end, AssetClass.FOREX, "1Min",
+                        )
+                        if df is None or df.empty:
+                            continue
+                        df = df.dropna(subset=["open", "high", "low", "close"])
+                        if df.empty:
+                            continue
+                        s.store.upsert_bars(df, sym, "1Min", AssetClass.FOREX, source="yfinance")
+                        last = df.iloc[-1]
+                        await bus.publish(BarEvent(
+                            symbol=sym, asset_class=AssetClass.FOREX,
+                            timestamp=df.index[-1].to_pydatetime(),
+                            open=Decimal(str(last["open"])), high=Decimal(str(last["high"])),
+                            low=Decimal(str(last["low"])), close=Decimal(str(last["close"])),
+                            volume=Decimal(str(last.get("volume", 0) or 0)), timeframe="1Min",
+                        ))
+                    except Exception as e:
+                        logger.debug("scalp forex poll {} failed: {}", sym, e)
+                await asyncio.sleep(60)
+
+        asyncio.create_task(_scalp_crypto_backfill(), name="scalp-crypto-backfill")
+        _SCALP_FOREX_TASK = asyncio.create_task(_scalp_forex_poller(), name="scalp-forex-poller")
+        s.add_alert(
+            "info",
+            f"Scalper armed · {len(DEFAULT_SCALP_CRYPTO)} crypto + {len(DEFAULT_SCALP_FOREX)} fx @1Min",
+        )
+
+        # Operational alert monitor (breaker / disconnect / unfilled-order)
+        from ea.monitoring.alerts import AlertMonitor
+        _ALERT_MONITOR = AlertMonitor(
+            s, risk=_RISK, streams=_STREAMS, order_mgr=_ORDER_MGR, interval_s=60.0,
+        )
+        _ALERT_MONITOR.start()
+
         s.add_alert(
             "info",
             f"Stack started · autosubmit={autosubmit} · LLM={'on' if analyzer.enabled else 'off'}",
@@ -179,6 +262,13 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
                 await _SIGNAL_CONSUMER.stop(); _SIGNAL_CONSUMER = None
             if _STRATEGY_RUNNER is not None:
                 await _STRATEGY_RUNNER.stop(); _STRATEGY_RUNNER = None
+            if _ALERT_MONITOR is not None:
+                await _ALERT_MONITOR.stop(); _ALERT_MONITOR = None
+            if _SCALP_FOREX_TASK is not None:
+                _SCALP_FOREX_TASK.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await _SCALP_FOREX_TASK
+                _SCALP_FOREX_TASK = None
             consumer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await consumer
@@ -406,6 +496,69 @@ def create_app(*, autosubmit: bool = False) -> FastAPI:
             raise HTTPException(404, f"strategy {name} not found")
         state_mod.get_state().add_alert("info", f"strategy resumed: {name}")
         return {"name": name, "enabled": True}
+
+    @app.get("/api/scalp")
+    async def api_scalp(limit: int = 30):
+        """Scalping-tab payload: smc_scalp signals + open scalp positions.
+
+        Full cross-strategy history still lives in the Signals/Orders/Positions
+        panels — this is a filtered focus view, not a separate ledger.
+        """
+        scalp_universe = set(DEFAULT_SCALP_CRYPTO) | set(DEFAULT_SCALP_FOREX)
+        enabled = _STRATEGY_RUNNER.is_enabled("smc_scalp") if _STRATEGY_RUNNER else False
+
+        signals: list[dict] = []
+        scalp_syms: set[str] = set()
+        if _SIGNAL_CONSUMER is not None:
+            for o in _SIGNAL_CONSUMER.recent:
+                if o.signal.strategy != "smc_scalp":
+                    continue
+                scalp_syms.add(o.signal.symbol)
+                signals.append({
+                    "timestamp": o.timestamp.isoformat(),
+                    "symbol": o.signal.symbol,
+                    "side": o.signal.side.value,
+                    "conviction": o.signal.conviction,
+                    "rationale": o.signal.rationale,
+                    "accepted": o.decision.ok,
+                    "reason": o.decision.reason,
+                    "submitted": o.order_record is not None and o.order_record.order is not None,
+                    "order_status": (
+                        o.order_record.order.status.value
+                        if o.order_record and o.order_record.order else None
+                    ),
+                })
+                if len(signals) >= limit:
+                    break
+
+        positions: list[dict] = []
+        try:
+            for p in await state_mod.positions_snapshot():
+                if p.get("symbol") in scalp_universe or p.get("symbol") in scalp_syms:
+                    positions.append(p)
+        except Exception:
+            pass
+
+        return {
+            "enabled": enabled,
+            "universe": {"crypto": DEFAULT_SCALP_CRYPTO, "forex": DEFAULT_SCALP_FOREX},
+            "timeframe": "1Min",
+            "signals": signals,
+            "positions": positions,
+            "signal_count": len(signals),
+        }
+
+    @app.post("/api/report/eod")
+    async def api_report_eod():
+        from ea.monitoring.reports import write_eod_report
+        try:
+            path = await write_eod_report(
+                order_mgr=_ORDER_MGR, signal_consumer=_SIGNAL_CONSUMER, risk=_RISK,
+            )
+            state_mod.get_state().add_alert("info", f"EOD report written: {path.name}")
+            return {"written": str(path)}
+        except Exception as e:
+            raise HTTPException(500, f"eod report failed: {e}")
 
     # --- Scanner endpoints ---
 

@@ -77,3 +77,18 @@ position_value = 16 * $50 = $800 (8% of equity, but only $50 at risk)
 ## Risk in backtests
 
 The backtest engine MUST apply the same risk framework as live. A strategy that looks great with no risk overlay but only mediocre with the overlay applied — the overlay version is the truth.
+
+## Implementation notes (as built)
+
+- **Sizing input — `RiskManager._atr_pct`.** ATR(14) as a fraction of last
+  close. Resolves bars by `signal.asset_class` (forex no longer misread as
+  stock) and walks **1Day → 1Hour → 1Min** before the last-resort flat 2%
+  default (`_ATR_DEFAULT_PCT`) — so a news-driven, never-streamed symbol still
+  gets a real volatility estimate instead of the crude constant. NaN-safe.
+- **Breakers enforced today:** daily-loss halt, weekly-loss halt, and
+  per-strategy consecutive-loss budget shrink (`RiskManager.snapshot()`
+  exposes `daily_halted` / `weekly_halted` / budget multipliers). VaR,
+  correlation, sector/cluster and regime overlays remain design targets.
+- **Operational alerts** (`ea/monitoring/alerts.py`) cover the breaker-trip,
+  stream-disconnect, and stale/errored-order rows of the Layer-4/6 tables;
+  they surface on the dashboard, deduped.
