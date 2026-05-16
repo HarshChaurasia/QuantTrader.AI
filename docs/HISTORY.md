@@ -5,6 +5,32 @@ authoritative "what actually happened" record — TASKS.md checkboxes are stale.
 
 ---
 
+## 2026-05-15 — Documentation sync
+
+Brought the design/spec docs in line with what's actually built (they had
+drifted: no SMC at all in STRATEGIES.md, vectorbt/SSE claims in
+ARCHITECTURE.md that were never adopted, A.5/A.6 unmarked in ROADMAP.md).
+
+- `CLAUDE.md`: scalper + backtest/report CLI, new key paths, corrected
+  conventions (TASKS.md retired, scalp crypto+forex/PDT, strict-confluence
+  reuse), refreshed current-state + pointers.
+- `docs/STRATEGIES.md`: added an "Implemented strategies (reality)" table
+  (news/xsection/smc/smc_scalp) and clarified the scalping exclusion vs the
+  user-approved SMC scalper.
+- `docs/ARCHITECTURE.md`: backtest section rewritten to as-built (any
+  timeframe, walk-forward, report.py; news-replay deferred; vectorbt not
+  adopted); monitoring section to real views + polling (not SSE) + built
+  reports/alerts.
+- `docs/RISK.md`: implementation-notes subsection (`_atr_pct` timeframe
+  walk + asset-class aware; breakers/alerts as built).
+- `docs/ROADMAP.md`: A.5 + A.6 annotated delivered.
+- **New:** `docs/OPERATIONS.md` — consolidated runbook (backfill, paper,
+  views, backtest, EOD, alerts, constraints).
+
+No code changes; tests unaffected.
+
+---
+
 ## 2026-05-15 — Intraday backtest + EOD reports/alerts + D/E cleanup
 
 Follow-up to the scalper: "fix it and complete remaining activities"

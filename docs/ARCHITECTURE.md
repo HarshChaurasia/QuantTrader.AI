@@ -118,12 +118,19 @@ Post-trade:
 
 ### Backtest engine (`ea/backtest/`)
 
-- Event-driven (not vectorized) — same code path as live.
-- Replays bars + historical news (from cache) + simulated fills with cost model (commission + slippage).
-- Cost model: stock slippage = 0.5 × spread + sqrt(volume) impact; crypto fees per venue; FX spread by pair.
-- Outputs: equity curve, drawdown series, trade log, per-strategy attribution, walk-forward metrics.
-
-Vectorbt is also used for fast strategy *research* (sweep parameters across thousands of configs), but final validation happens in the event-driven engine.
+- Event-driven (not vectorized) — same Strategy → Risk → Order code path as live.
+- **As built** (`ea/backtest/`): `engine.py` replays stored bars at **any
+  timeframe** (1Min/5Min/15Min/1Hour/1Day, `--timeframe`), fills at next-bar
+  open + slippage/commission cost model, time-stop exits; `walkforward.py`
+  runs segmented out-of-sample windows with compounded equity; `report.py`
+  writes a markdown+JSON run report.
+- Outputs: equity curve, drawdown, trade log, per-strategy attribution,
+  Sharpe (annualised per timeframe), CAGR, walk-forward per-window breakdown.
+- **Deferred:** news-driven replay (needs cached LLM analyses paired to bar
+  dates) — daily/intraday technical strategies backtest fully today.
+- Vectorbt is **not** adopted (not a dependency). If parameter-sweep research
+  is ever needed it would be added then; final validation is the event-driven
+  engine regardless.
 
 ### Monitoring (`ea/monitoring/`) — sci-fi dashboard + reports
 
@@ -146,11 +153,20 @@ Controls:
 - **Watchlist edit** — subscribe/unsubscribe symbols at runtime (Phase A.2+).
 - **Refresh / auto-refresh toggle** — for snapshot data.
 
-Live updates via Server-Sent Events (SSE) — simpler than WebSocket for one-way push, works through proxies, easy to reconnect.
+**As built — views (left nav):** Chart, Scanner, News, **Scalping** (1Min SMC
+focus: scalp signals, open scalp positions, scalper on/off toggle — full
+cross-strategy history stays in the Chart view's Positions/Orders/Signals
+panels), System Monitor. Live updates are currently **short-interval polling**
+of JSON endpoints (5–30s), not SSE — SSE remains a possible later optimisation.
 
-**Alerts.** Console + optional webhook (Discord/Slack) on: circuit breaker trip, broker disconnect, large single-name loss, unfilled order timeout. Dashboard surfaces the same alerts in a banner.
+**Alerts.** `ea/monitoring/alerts.py` — `AlertMonitor` 60s loop, key-deduped,
+raises dashboard alerts on: circuit-breaker trip, stream disconnect, and
+stale/errored orders. Webhook (Discord/Slack) not yet wired.
 
-**Reports.** Daily EOD report (markdown to disk + optional webhook): P&L, trades, attribution, comparison to backtest expectation, anomaly flags.
+**Reports.** `ea/monitoring/reports.py` — daily EOD markdown to
+`reports/eod_<date>.md` (account, positions, today's orders,
+signals-by-strategy, risk, alerts). Triggered by `ea report` CLI or
+`POST /api/report/eod`. Backtest-expectation comparison is manual for now.
 
 ## Data flow examples
 

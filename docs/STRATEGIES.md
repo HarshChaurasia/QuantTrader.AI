@@ -69,9 +69,34 @@ Run all selected strategies concurrently with **risk-budget allocation, not equa
 
 This means a single failing strategy can't sink the portfolio, and the system survives long enough for the working strategies to compound.
 
+## Implemented strategies (as built — reality vs. candidates above)
+
+The candidates above are the design menu. What actually runs in parallel today
+(registered in `StrategyRunner`, validated by the event-driven backtest):
+
+| Name | Maps to | Asset classes | Timeframe | Notes |
+|---|---|---|---|---|
+| `news_momentum` | S2 | stock, crypto | event | LLM-scored catalyst drift |
+| `xsection_momentum` | S3 / C2 | stock, crypto | 1Day | pure factor baseline |
+| `smc` | (new) | stock, crypto, forex | 1Hour | SMC swing: BOS/LiqSweep + FVG/OB, in-zone, strict confluence, 24h re-entry cooldown |
+| `smc_scalp` | (new) | crypto, forex | 1Min | **same `evaluate_setup` as `smc`, unchanged** — only timeframe/cooldown/RR differ |
+
+SMC (Smart Money Concepts) was not in the original candidate list; it was added
+as a structure-based technical strategy. Confluence is deliberately strict
+(user decision) — sparse setups are correct behaviour, not a bug. `smc_scalp`
+gets scalp frequency purely from the 1Min timeframe; it does **not** loosen the
+gates. Forex scalp is signal-only (no live execution until OANDA / Phase C).
+
+PEAD (S1), the crypto C1/C3 strategies, and FX F1–F3 remain unimplemented (see
+`docs/REMAINING.md`).
+
 ## Strategies explicitly NOT in scope
 
-- **Mean-reversion intraday scalping.** Out of scope per pivot — competes with HFT, fees dominate.
+- **Mean-reversion intraday scalping.** Out of scope — competes with HFT, fees
+  dominate. *Note:* `smc_scalp` is **not** this — it is structure-based (SMC
+  zones + confluence), momentum-direction, on liquid crypto/FX only, added at
+  explicit user request. The exclusion still holds for naive RSI/MACD
+  mean-reversion scalping.
 - **Options strategies.** Phase D+ at earliest. Adds another dimension of risk that's not productive to manage in v1.
 - **Pure technical-only (no catalyst/factor):** RSI/MACD/chart patterns alone don't have edge after costs. We use technicals for *exits and risk sizing*, not entries.
 - **Crypto perp basis arb / funding rate harvest.** Real edge but requires venue accounts (Binance/Bybit) and active hedge management. Defer.
